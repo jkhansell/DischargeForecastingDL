@@ -1,31 +1,58 @@
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
-from flax.training import train_state
 
-class LSTM(nn.Module):
+from flax.linen import nn
+from typing import Any, Callable, Tuple
+
+class LTCNCell(nn.Module):
     hidden_size: int
+    activation: Callable = nn.tanh
 
     @nn.compact
+    def __call__(self, carry, inputs, dt):
+        h = carry  # shape (hidden_size,)
+        input_dim = inputs.shape[-1]
+
+        gamma = self.param("gamma", nn.initializers.xavier_uniform(),
+                           (input_dim, self.hidden_size))
+        gamma_r = self.param("gamma_r", nn.initializers.xavier_uniform(),
+                             (self.hidden_size, self.hidden_size))
+        mu = self.param("mu", nn.initializers.uniform(),
+                        (self.hidden_size,))
+        A = self.param("A", nn.initializers.uniform(),
+                       (self.hidden_size,))
+        tau = self.param("tau", nn.initializers.constant(1.0),
+                         (self.hidden_size,))
+
+        # --- Encode input ---
+        I_t = jnp.dot(inputs, gamma)            # (hidden_size,)
+        x_t = jnp.dot(h, gamma_r) + mu              # (hidden_size,)
+
+        # --- Nonlinearity ---
+        f = self.activation(x_t + I_t)
+
+        # --- Liquid time-constant integration ---
+        x_tp1 = (x_t + dt * f * A) / (1 + dt * (1 / tau + f))
+
+        return x_tp1, x_tp1
+
+class LTCN(nn.Module):
+    hidden_size: int
+    
+    @nn.compact
     def __call__(self, x):
-        """
-        x: (batch, time, features)
-        returns: (batch, time, hidden_size)
-        """
         B, T, D = x.shape
         h0 = jnp.zeros((B, self.hidden_size))
-        c0 = jnp.zeros((B, self.hidden_size))
 
-        # Wrap the OptimizedLSTMCell with scan across time
-        lstm_scan = nn.scan(
-            nn.OptimizedLSTMCell,
+        ltcn_scan = nn.scan(
+            LTCNCell, 
             variable_broadcast="params",
             split_rngs={"params": False},
             in_axes=1,    # time axis in input
             out_axes=1    # keep time axis in outputs
-        )(self.hidden_size, name="lstm_cell")
-
-        (h_final, c_final), outputs = lstm_scan((h0, c0), x)
+        )(self.hidden_size, name="ltcn_cell")
+    
+        x_final, outputs = ltcn_scan(h0, x)
         return outputs
 
 class SeqRegressor(nn.Module):
@@ -41,14 +68,14 @@ class SeqRegressor(nn.Module):
         out = nn.Dense(self.features * self.quantiles)(x)
         return out.reshape(x.shape[0], self.features, self.quantiles)
 
-class LSTMRegressor(nn.Module):
+class LTCNRegressor(nn.Module):
     features: int
     quantiles: int
     hidden_size: int
 
     @nn.compact
     def __call__(self, x):
-        lstm = LSTM(hidden_size=self.hidden_size)
+        lstm = LTCN(hidden_size=self.hidden_size)
         regressor = SeqRegressor(self.features, self.quantiles)
 
         x = lstm(x)
@@ -56,21 +83,9 @@ class LSTMRegressor(nn.Module):
 
         return out
 
-class LSTMTrainState(train_state.TrainState):
+class LTCNTrainState(train_state.TrainState):
     pass
 
-@jax.jit
-def quantile_loss(y_pred, y_true, quantiles):
-    """
-    y_pred: (Nstations, Nquantiles)
-    y_true: (Nstations,) or (Nstations,1)
-    quantiles: 1D array of quantiles, shape (Nquantiles,)
-    """
-    # Ensure y_true has shape (Nstations, 1)
-
-    error = y_true - y_pred                     # (Nstations, Nquantiles)
-    loss = jnp.maximum(quantiles * error, (quantiles - 1) * error)
-    return jnp.mean(loss)
 
 @jax.jit
 def quantile_loss_complex(
@@ -106,8 +121,9 @@ def quantile_loss_complex(
     # Return either per-quantile or total
     return total_loss
 
+
 @jax.jit
-def LSTMtrain_step(state, batch, quantiles):
+def LTCNtrain_step(state, batch, quantiles):
     """
     state: TrainState
     batch: dict with "x" and "y"
@@ -138,7 +154,7 @@ def LSTMtrain_step(state, batch, quantiles):
     return state, loss
 
 @jax.jit
-def LSTMeval_step(state, batch, quantiles):
+def LTCNeval_step(state, batch, quantiles):
     """
     state: TrainState
     batch: dict with "x" and "y"
@@ -159,20 +175,3 @@ def LSTMeval_step(state, batch, quantiles):
     )
     return loss, preds
     
-
-if __name__ == "__main__":
-    # Dummy data
-    batch_size, time, input_features = 8, 20, 10
-    features, hidden_size = 5, 32
-    quantiles = jnp.array([0.1, 0.5, 0.9])
-
-    key = jax.random.PRNGKey(0)
-    x = jax.random.normal(key, (batch_size, time, input_features))
-    y = jax.random.normal(key, (batch_size, features))
-
-    # Initialize model
-    model = LSTMRegressor(features=features, quantiles=len(quantiles), hidden_size=hidden_size)
-    variables = model.init(key, x)
-
-    y_pred = model.apply(variables, x)
-    print(y_pred.shape)

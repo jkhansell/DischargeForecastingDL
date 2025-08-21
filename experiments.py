@@ -1,4 +1,4 @@
-from experiments.discharge_forecast import train_model
+from experiments.LSTM_forecast import train_model
 
 if __name__ == "__main__":
     train_model()

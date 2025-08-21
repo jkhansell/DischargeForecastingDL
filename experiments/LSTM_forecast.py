@@ -90,7 +90,7 @@ def train_model():
     in_stations = jnp.array([i for i in range(len(Q.columns))])
     out_stations = jnp.array([cols["08166200"]])
 
-    time_window = 32        # 8 hours of context 
+    time_window = 64        # 16 hours of context 
     horizons = (15*4*jnp.array([2, 4, 8, 16, 32]))  # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
     
     device_cpu = jax.devices("cpu")[0]
@@ -104,7 +104,7 @@ def train_model():
     Y = jnp.log10(Y)
 
     # make batches 
-    batch_size = 512
+    batch_size = 256
     
     assert batch_size % jax.local_device_count() == 0
 
@@ -114,7 +114,7 @@ def train_model():
 
     in_features = X.shape[-1]
     out_features = Y.shape[-2]
-    hidden_size = 64
+    hidden_size = 32
     quantiles = jnp.array([0.1, 0.5, 0.9])
     quantiles_b = jnp.broadcast_to(quantiles, (jax.local_device_count(),) + quantiles.shape)
     
@@ -123,7 +123,12 @@ def train_model():
 
     model = LSTMRegressor(features=out_features, quantiles=len(quantiles), hidden_size=hidden_size)
     params = model.init(key, x)
-    tx = optax.adamw(learning_rate=5e-3, weight_decay=1e-4)
+
+    # learning rate
+    lr_scheduler = optax.schedules.cosine_decay_schedule(init_value=1e-3, decay_steps=5, alpha=0.001, exponent=1.0)
+
+
+    tx = optax.adamw(learning_rate=lr_scheduler, weight_decay=1e-4)
     state = LSTMTrainState.create(apply_fn=model.apply, params=params,tx=tx)
 
     print(jax.local_devices())
@@ -168,7 +173,8 @@ def train_model():
         train_losses.append(loss_train)
         val_losses.append(loss_val)
 
-        print(f"Epoch {epoch+1}, Train Loss: {loss_train.item():.4f}, Val Loss: {loss_val.item():.4f}")
+        print(f"Epoch {epoch+1} | Learning rate {lr_scheduler(epoch)}") 
+        print(f"Train Loss: {loss_train.item():.4f}, Val Loss: {loss_val.item():.4f}")
 
     # Testing phase
     test_gen = batch_iterator(test, batch_size=batch_size, shuffle=False)
