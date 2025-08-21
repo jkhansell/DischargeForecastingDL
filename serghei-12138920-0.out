@@ -1,0 +1,60 @@
+2025-08-19 23:33:05.881403: W external/xla/xla/service/gpu/autotuning/dot_search_space.cc:200] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs?Working around this by using the full hints set instead.
+2025-08-19 23:33:08.863823: W external/xla/xla/service/gpu/autotuning/dot_search_space.cc:200] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs?Working around this by using the full hints set instead.
+2025-08-19 23:33:08.863877: W external/xla/xla/service/gpu/autotuning/dot_search_space.cc:200] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs?Working around this by using the full hints set instead.
+2025-08-19 23:33:08.863889: W external/xla/xla/service/gpu/autotuning/dot_search_space.cc:200] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs?Working around this by using the full hints set instead.
+2025-08-19 23:33:32.280180: W external/xla/xla/service/gpu/autotuning/dot_search_space.cc:200] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs?Working around this by using the full hints set instead.
+2025-08-19 23:33:32.280226: W external/xla/xla/service/gpu/autotuning/dot_search_space.cc:200] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs?Working around this by using the full hints set instead.
+2025-08-19 23:33:37.957351: W external/xla/xla/service/gpu/autotuning/dot_search_space.cc:200] All configs were filtered out because none of them sufficiently match the h[CudaDevice(id=0), CudaDevice(id=1), CudaDevice(id=2), CudaDevice(id=3)]
+Epoch 1, Train Loss: 4.2864, Val Loss: 1.8514
+Epoch 2, Train Loss: 4.0819, Val Loss: 1.5096
+Epoch 3, Train Loss: 2.9034, Val Loss: 1.1953
+Epoch 4, Train Loss: 2.3651, Val Loss: 0.9668
+Epoch 5, Train Loss: 2.2488, Val Loss: 0.8905
+Epoch 6, Train Loss: 1.9385, Val Loss: 0.6319
+Epoch 7, Train Loss: 1.8651, Val Loss: 0.3895
+Epoch 8, Train Loss: 1.7617, Val Loss: 0.4221
+Epoch 9, Train Loss: 1.8475, Val Loss: 0.6052
+Epoch 10, Train Loss: 1.8425, Val Loss: 1.0172
+Epoch 11, Train Loss: 1.6389, Val Loss: 0.8201
+Epoch 12, Train Loss: 1.5569, Val Loss: 0.8337
+Epoch 13, Train Loss: 2.3129, Val Loss: 0.7496
+Epoch 14, Train Loss: 2.2683, Val Loss: 0.5893
+Epoch 15, Train Loss: 2.2585, Val Loss: 0.8262
+Epoch 16, Train Loss: 2.8296, Val Loss: 1.8175
+Epoch 17, Train Loss: 4.1162, Val Loss: 1.8231
+Epoch 18, Train Loss: 4.1158, Val Loss: 1.8273
+Epoch 19, Train Loss: 4.1162, Val Loss: 1.8243
+Epoch 20, Train Loss: 4.1162, Val Loss: 1.8444
+Epoch 21, Train Lossints. Maybe the hints set does not contain a good representative set of valid configs?Working around this by using the full hints set instead.
+
+: 4.1162, Val Loss: 1.8294
+Epoch 22, Train Loss: 4.1165, Val Loss: 1.8488
+Epoch 23, Train Loss: 4.1156, Val Loss: 1.8440
+Epoch 24, Train Loss: 4.1156, Val Loss: 1.8263
+Epoch 25, Train Loss: 4.1161, Val Loss: 1.8529
+Epoch 26, Train Loss: 4.1161, Val Loss: 1.8374
+Epoch 27, Train Loss: 4.1166, Val Loss: 1.8469
+Epoch 28, Train Loss: 4.1163, Val Loss: 1.8446
+Epoch 29, Train Loss: 4.1162, Val Loss: 1.8154
+Epoch 30, Train Loss: 4.1164, Val Loss: 1.8472
+Epoch 31, Train Loss: 4.1169, Val Loss: 1.8392
+Epoch 32, Train Loss: 4.1169, Val Loss: 1.8462
+Epoch 33, Train Loss: 4.1165, Val Loss: 1.8351
+Epoch 34, Train Loss: 4.1166, Val Loss: 1.8407
+Epoch 35, Train Loss: 4.1163, Val Loss: 1.8303
+Epoch 36, Train Loss: 4.1166, Val Loss: 1.8620
+Epoch 37, Train Loss: 4.1165, Val Loss: 1.8470
+Epoch 38, Train Loss: 4.1171, Val Loss: 1.8475
+Epoch 39, Train Loss: 4.1160, Val Loss: 1.8484
+Epoch 40, Train Loss: 4.1164, Val Loss: 1.8323
+Epoch 41, Train Loss: 4.1165, Val Loss: 1.8578
+Epoch 42, Train Loss: 4.1156, Val Loss: 1.8415
+Epoch 43, Train Loss: 4.1162, Val Loss: 1.8311
+Epoch 44, Train Loss: 4.1171, Val Loss: 1.8141
+Epoch 45, Train Loss: 4.1161, Val Loss: 1.8520
+Epoch 46, Train Loss: 4.1167, Val Loss: 1.8418
+Epoch 47, Train Loss: 4.1162, Val Loss: 1.8357
+Epoch 48, Train Loss: 4.1168, Val Loss: 1.8245
+Epoch 49, Train Loss: 4.1156, Val Loss: 1.8271
+Epoch 50, Train Loss: 4.1168, Val Loss: 1.8129
+
