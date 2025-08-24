@@ -1,10 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name="Train LSTM"
-#SBATCH --account=ehrtas
 #SBATCH --time=01:00:00
-#SBATCH --nodes=1
-#SBATCH --partition=develbooster
+#SBATCH --nodes=2
+#SBATCH --partition=nukwa-wide
 #SBATCH --mail-type=NONE
 #SBATCH --output=serghei-%j-%t.out
 
-mamba run -n OL python experiments.py
+srun --exclusive mamba run -n OL python experiments.py lstm & 
+srun --exclusive mamba run -n OL python experiments.py ltcn & 
+
+wait

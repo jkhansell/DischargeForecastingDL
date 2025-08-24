@@ -6,10 +6,13 @@ import re
 from utils.datautils import (
     get_data, build_multi_horizon_dataset, 
     get_discharges, create_train_val_test,
-    batch_iterator, prefetch_batches, shard_batch, reshape_fn
+    batch_iterator, prefetch_batches, shard_batch, reshape_fn,
+    boxcox_decode, boxcox_encode
 )
 
-from models.LTCN import LTCNRegressor, LTCNTrainState, LTCNtrain_step, LTCNeval_step
+from utils.trainingutils import cosine_annealing
+
+from models.QATN import QATNRegressor, QATNTrainState, QATNtrain_step, QATNeval_step
 
 
 # import DL libraries
@@ -22,13 +25,12 @@ import optax
 # Define a mapping from window suffix to temporal length (in increasing order)
 temporal_order = {
     "": 0,      # original column
-    "12h": 1,
-    "1D": 2,
-    "1W": 3,
-    "2W": 4,
-    "1M": 5,
-    "3M": 6,
-    "6M": 7
+    "3h": 1,
+    "6h": 2,
+    "12h": 3,
+    "1D": 4,
+    "1W": 5,
+    "2W": 6,
 }
 
 def sort_key(col):
@@ -60,13 +62,12 @@ def train_model():
 
     # 15-min resolution -> integer number of rows
     windows = {
+        "3h": 12,
+        "6h": 24,
         "12h": 48,
         "1D": 96,
         "1W": 672,
         "2W": 1344,
-        "1M": 2880,
-        "3M": 8640,
-        "6M": 17280
     }
 
     time = Q.select("datetime")
@@ -76,100 +77,104 @@ def train_model():
     ma_features = []
     cols = {}
     for i,col in enumerate(Q.columns):
-        for key, value in windows.items():
-            ma_features.append(
-                pl.col(col).rolling_mean(window_size=value, min_periods=1).alias(f"{col}_MA_{key}")
-            )
+        #for key, value in windows.items():
+        #    ma_features += [
+        #        pl.col(col).rolling_std(window_size=value, min_periods=1).alias(f"{col}_STD_{key}"),
+        #        pl.col(col).rolling_min(window_size=value, min_periods=1).alias(f"{col}_MIN_{key}"),
+        #        pl.col(col).rolling_max(window_size=value, min_periods=1).alias(f"{col}_MAX_{key}"),
+        #        pl.col(col).rolling_mean(window_size=value, min_periods=1).alias(f"{col}_MEAN_{key}"),
+        #        #(pl.col(col) - pl.col(col).shift(value)).alias(f"{col}_SLOPE_{key}"),
+        #        #(pl.col(col) - pl.col(col).rolling_mean(window_size=value, min_periods=1)).alias(f"{col}_RESID_{key}"),
+        #    ]
         cols[col] = i
     # Add rolling means as new columns
-    Q = Q.with_columns(ma_features)
-    Q = Q.select(sorted(Q.columns, key=sort_key))
+    #Q = Q.with_columns(ma_features)
+    #Q = Q.select(sorted(Q.columns, key=sort_key))
+    #Q = Q.drop_nulls()
+    print(Q)
 
     # build lagged dataset
 
     in_stations = jnp.array([i for i in range(len(Q.columns))])
     out_stations = jnp.array([cols["08166200"]])
 
-    time_window = 32        # 16 hours of context 
+    time_window = 32        # 32 hours of context 
     horizons = (15*4*jnp.array([2, 4, 8, 16, 32]))  # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
     
     device_cpu = jax.devices("cpu")[0]
     Q_cpu = jax.device_put(Q.to_numpy(), device=device_cpu)
 
+
     # compiling function for CPU
     X, Y, Y_idx = build_multi_horizon_dataset(Q_cpu, in_stations, out_stations, time_window, horizons)
     time = time.to_numpy()[Y_idx]
 
-    X = jnp.log10(X)
-    Y = jnp.log10(Y)
+    #lam = -1.5
+    X = jnp.log10(X+1)
+    Y = jnp.log10(Y+1)
 
+    #Xmax = X.max(axis=1, keepdims=True)
+    #Ymax = Y.max(axis=1, keepdims=True)
+    
     # make batches 
     batch_size = 128
-    
     assert batch_size % jax.local_device_count() == 0
 
     train, val, test, times = create_train_val_test(X, Y, time)
     
-    num_epochs = 35
+    num_epochs = 20
 
     in_features = X.shape[-1]
     out_features = Y.shape[-2]
-    hidden_size = 32
+    hidden_size = 64
     quantiles = jnp.array([0.05, 0.5, 0.95])
     quantiles_b = jnp.broadcast_to(quantiles, (jax.local_device_count(),) + quantiles.shape)
     
     key = jax.random.PRNGKey(123)
     x = jnp.zeros((batch_size, time_window, in_features))
 
-    model = LTCNRegressor(
+    model = QATNRegressor(
         features=out_features, 
         quantiles=len(quantiles), 
         hidden_size=hidden_size,
-        dt=0.25
+        depth=4, 
+        n_heads=4,
+        causal=True, 
+        dropout=0.0 
     )
 
     params = model.init(key, x)
-
-    # learning rate
-    #warmup_steps = 500
-    #total_steps = num_epochs * (len(train["x"]) // batch_size)
-
-    #schedule = optax.warmup_cosine_decay_schedule(
-    #    init_value=1e-5,      # starting LR at warmup
-    #    peak_value=1e-4,      # max LR
-    #    warmup_steps=warmup_steps,
-    #    decay_steps=total_steps - warmup_steps,
-    #    end_value=1e-5        # final LR at end of training
-    #)
-
-    #tx = optax.chain(
-    #    optax.clip_by_global_norm(1.0),  # clip gradients to norm 1.0
-    #    optax.adamw(learning_rate=schedule, weight_decay=5e-5)
-    #)
 
     # Training setup
     steps_per_epoch = len(train["x"]) // batch_size
     total_steps = num_epochs * steps_per_epoch
     warmup_steps = 150
 
-    print(total_steps)
+    #schedule = optax.warmup_cosine_decay_schedule(
+    #    init_value=1e-5,          # very small start
+    #    peak_value=8e-4,          # max LR (after warmup)
+    #    warmup_steps=warmup_steps,
+    #    decay_steps=total_steps-warmup_steps,  # decay until end of training
+    #    end_value=1e-6            # LR at final step (lower = steeper decay)
+    #)
 
-    schedule = optax.warmup_cosine_decay_schedule(
-        init_value=1e-5,          # very small start
-        peak_value=8e-4,          # max LR (after warmup)
-        warmup_steps=warmup_steps,
-        decay_steps=total_steps-warmup_steps,  # decay until end of training
-        end_value=1e-6            # LR at final step (lower = steeper decay)
+    schedule = lambda step: cosine_annealing(
+        step,
+        base_lr=1e-3,
+        min_lr=1e-4,
+        steps_per_cycle=total_steps//2,
+        m_mul=0.5,
+        t_mul=1.0
     )
 
-    tx = optax.adamw(learning_rate=schedule, weight_decay=1e-5)
-    
-    state = LTCNTrainState.create(apply_fn=model.apply, params=params,tx=tx)
+    tx = optax.noisy_sgd(learning_rate=schedule)#, weight_decay=5e-5)
+
+    state = QATNTrainState.create(apply_fn=model.apply, params=params,tx=tx)
 
     print(jax.local_devices())
     # training using data parallelism
-    p_LTCNtrain_step = jax.pmap(LTCNtrain_step, axis_name="batch")
-    p_LTCNeval_step = jax.pmap(LTCNeval_step, axis_name="batch")
+    p_QATNtrain_step = jax.pmap(QATNtrain_step, axis_name="batch")
+    p_QATNeval_step = jax.pmap(QATNeval_step, axis_name="batch")
     state = jax.device_put_replicated(state, jax.local_devices())
 
     train_losses = []
@@ -179,11 +184,11 @@ def train_model():
         
         # Regular batch iterator
         train_gen = batch_iterator(train, batch_size=batch_size, shuffle=True)
-        train_prefetch = prefetch_batches(train_gen, prefetch_size=32)
+        train_prefetch = prefetch_batches(train_gen, prefetch_size=2)
 
         # Regular batch iterator
         val_gen = batch_iterator(val, batch_size=batch_size, shuffle=True)
-        val_prefetch = prefetch_batches(val_gen, prefetch_size=32)
+        val_prefetch = prefetch_batches(val_gen, prefetch_size=2)
 
         # Training phase
         train_loss = []
@@ -191,13 +196,13 @@ def train_model():
 
         for batch in train_prefetch:
             batch = shard_batch(batch)
-            state, loss = p_LTCNtrain_step(state, batch, quantiles_b)
+            state, loss = p_QATNtrain_step(state, batch, quantiles_b)
             train_loss.append(loss)
 
         # Validation phase
         for batch in val_prefetch:
             batch = shard_batch(batch)
-            loss, _ = p_LTCNeval_step(state, batch, quantiles_b)
+            loss, _ = p_QATNeval_step(state, batch, quantiles_b)
             val_loss.append(loss)
 
         # Compute epoch averages
@@ -223,7 +228,7 @@ def train_model():
         
     for batch in test_prefetch:
         batch = shard_batch(batch)
-        loss, preds = p_LTCNeval_step(state, batch, quantiles_b)
+        loss, preds = p_QATNeval_step(state, batch, quantiles_b)
         test_loss.append(np.mean(loss))
         
         # append for graphing
@@ -248,26 +253,31 @@ def train_model():
     ax.set_ylabel("Loss")
     ax.grid(alpha=0.25, which="both")
     fig.legend()
-    fig.savefig("LTCN_Loss.png")
+    fig.savefig("QATN_Loss.png")
     plt.close()
 
     fig, ax = plt.subplots(figsize=(8,5))
     ax.hist(test_loss, label="Test Loss Histogram")
     fig.legend()
-    fig.savefig("LTCN_Test_Loss.png")
+    fig.savefig("QATN_Test_Loss.png")
     plt.close()
 
     # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
 
+    #decoded_medians = 10**( medians) #boxcox_decode(medians, lam)
+    #decoded_lows = 10**(lows) #boxcox_decode(lows, lam)
+    #decoded_highs = 10**(highs) #boxcox_decode(highs, lam)
+
+
     for i in range(medians.shape[1]):
         fig, ax = plt.subplots(figsize=(12,5))
-        ax.plot(10**medians[:,i], label="Median")
-        ax.fill_between(np.arange(lows[:,i].shape[0]), 10**lows[:,i], 10**highs[:,i], alpha=0.25, label="Quantiles = [0.05,0.95]")
+        ax.plot(10**(medians[:,i]-1), label="Median")
+        ax.fill_between(np.arange(lows[:,i].shape[0]), 10**(lows[:,i]-1), 10**(highs[:,i]-1), alpha=0.25, label="Quantiles = [0.05,0.95]")
         ax.plot(10**truths[:,i], label="Ground Truth")
         ax.set_xlabel("Time point")
         ax.set_ylabel("Flow Discharge [m^3/s]")
         ax.grid(alpha=0.25)
         ax.set_yscale("log")
         fig.legend()
-        fig.savefig(f"LTCNpredictions_{i}.png")
+        fig.savefig(f"QATNpredictions_{i}.png")
         plt.close()

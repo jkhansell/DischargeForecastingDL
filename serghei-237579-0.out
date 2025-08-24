@@ -1,0 +1,5 @@
+srun: Job step aborted: Waiting up to 32 seconds for job step to finish.
+srun: Job step aborted: Waiting up to 32 seconds for job step to finish.
+slurmstepd: error: *** JOB 237579 ON nukwa-02.cnca CANCELLED AT 2025-08-22T18:46:24 ***
+slurmstepd: error: *** STEP 237579.0 ON nukwa-02.cnca CANCELLED AT 2025-08-22T18:46:24 ***
+slurmstepd: error: *** STEP 237579.1 ON nukwa-02.cnca CANCELLED AT 2025-08-22T18:46:24 ***

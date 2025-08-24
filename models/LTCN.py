@@ -1,15 +1,17 @@
 import jax
 import jax.numpy as jnp
+import flax.linen as nn
+from flax.training import train_state
 
-from flax.linen import nn
 from typing import Any, Callable, Tuple
 
 class LTCNCell(nn.Module):
     hidden_size: int
+    dt: float
     activation: Callable = nn.tanh
 
     @nn.compact
-    def __call__(self, carry, inputs, dt):
+    def __call__(self, carry, inputs):
         h = carry  # shape (hidden_size,)
         input_dim = inputs.shape[-1]
 
@@ -32,15 +34,14 @@ class LTCNCell(nn.Module):
         f = self.activation(x_t + I_t)
 
         # --- Liquid time-constant integration ---
-        x_tp1 = (x_t + dt * f * A) / (1 + dt * (1 / tau + f))
+        x_tp1 = (x_t + self.dt * f * A) / (1 + self.dt * (1 / tau + f))
 
         return x_tp1, x_tp1
 
 class LTCN(nn.Module):
     hidden_size: int
-    
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, dt):
         B, T, D = x.shape
         h0 = jnp.zeros((B, self.hidden_size))
 
@@ -50,7 +51,7 @@ class LTCN(nn.Module):
             split_rngs={"params": False},
             in_axes=1,    # time axis in input
             out_axes=1    # keep time axis in outputs
-        )(self.hidden_size, name="ltcn_cell")
+        )(self.hidden_size, dt, name="ltcn_cell")
     
         x_final, outputs = ltcn_scan(h0, x)
         return outputs
@@ -66,20 +67,24 @@ class SeqRegressor(nn.Module):
         returns: (batch, features, quantiles)
         """
         out = nn.Dense(self.features * self.quantiles)(x)
-        return out.reshape(x.shape[0], self.features, self.quantiles)
+        return out
 
 class LTCNRegressor(nn.Module):
     features: int
     quantiles: int
     hidden_size: int
+    dt: float
 
     @nn.compact
     def __call__(self, x):
-        lstm = LTCN(hidden_size=self.hidden_size)
-        regressor = SeqRegressor(self.features, self.quantiles)
+        ltcn = LTCN(hidden_size=self.hidden_size)
+        regressors = [SeqRegressor(1, self.quantiles) for _ in range(self.features)]  
 
-        x = lstm(x)
-        out = regressor(x[:,-1,:])
+        x = ltcn(x, self.dt)
+
+        out = jnp.stack([regressor(x[:,-1,:]) for regressor in regressors],axis=1)
+
+        #out = regressor(x[:,-1,:])
 
         return out
 
@@ -113,8 +118,6 @@ def quantile_loss_complex(
         return jnp.mean(jnp.maximum(0, y_pred[:, :-1] - y_pred[:, 1:]))
     crossing_penalty = jax.lax.cond(crossing_penalty_coef > 0.0, compute_penalty, lambda _: 0.0, operand=None)
 
-    # Weighted loss
-
     # Combine
     total_loss = loss + crossing_penalty_coef * crossing_penalty + mae_coef * mae
 
@@ -134,7 +137,7 @@ def LTCNtrain_step(state, batch, quantiles):
         preds = state.apply_fn(params, batch['x'])
         loss = quantile_loss_complex(
             preds, batch['y'], quantiles,
-            crossing_penalty_coef=0.5, mae_coef=0.5
+            crossing_penalty_coef=0.0, mae_coef=1.0
         )
         
         return loss 
@@ -165,7 +168,7 @@ def LTCNeval_step(state, batch, quantiles):
         preds = state.apply_fn(params, batch['x'])
         loss = quantile_loss_complex(
             preds, batch['y'], quantiles,
-            crossing_penalty_coef=0.5, mae_coef=0.5
+            crossing_penalty_coef=0.0, mae_coef=1.0
         )
         return loss, preds
     

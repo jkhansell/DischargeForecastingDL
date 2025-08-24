@@ -16,8 +16,8 @@ from models.LSTM import LSTMRegressor, LSTMTrainState, LSTMtrain_step, LSTMeval_
 import jax
 import jax.numpy as jnp
 import flax.linen as nn 
+from flax.jax_utils  import prefetch_to_device
 import optax
-
 
 # Define a mapping from window suffix to temporal length (in increasing order)
 temporal_order = {
@@ -90,7 +90,7 @@ def train_model():
     in_stations = jnp.array([i for i in range(len(Q.columns))])
     out_stations = jnp.array([cols["08166200"]])
 
-    time_window = 64        # 16 hours of context 
+    time_window = 32        # 16 hours of context 
     horizons = (15*4*jnp.array([2, 4, 8, 16, 32]))  # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
     
     device_cpu = jax.devices("cpu")[0]
@@ -104,7 +104,7 @@ def train_model():
     Y = jnp.log10(Y)
 
     # make batches 
-    batch_size = 256
+    batch_size = 64
     
     assert batch_size % jax.local_device_count() == 0
 
@@ -115,7 +115,7 @@ def train_model():
     in_features = X.shape[-1]
     out_features = Y.shape[-2]
     hidden_size = 32
-    quantiles = jnp.array([0.1, 0.5, 0.9])
+    quantiles = jnp.array([0.05, 0.5, 0.95])
     quantiles_b = jnp.broadcast_to(quantiles, (jax.local_device_count(),) + quantiles.shape)
     
     key = jax.random.PRNGKey(123)
@@ -124,11 +124,24 @@ def train_model():
     model = LSTMRegressor(features=out_features, quantiles=len(quantiles), hidden_size=hidden_size)
     params = model.init(key, x)
 
-    # learning rate
-    lr_scheduler = optax.schedules.cosine_decay_schedule(init_value=1e-3, decay_steps=5, alpha=0.001, exponent=1.0)
 
+    # Training setup
+    steps_per_epoch = len(train["x"]) // batch_size
+    total_steps = num_epochs * steps_per_epoch
+    warmup_steps = 150
 
-    tx = optax.adamw(learning_rate=lr_scheduler, weight_decay=1e-4)
+    print(total_steps)
+
+    schedule = optax.warmup_cosine_decay_schedule(
+        init_value=1e-5,          # very small start
+        peak_value=8e-4,          # max LR (after warmup)
+        warmup_steps=warmup_steps,
+        decay_steps=total_steps-warmup_steps,  # decay until end of training
+        end_value=1e-6            # LR at final step (lower = steeper decay)
+    )
+
+    tx = optax.adamw(learning_rate=schedule, weight_decay=1e-5)
+    
     state = LSTMTrainState.create(apply_fn=model.apply, params=params,tx=tx)
 
     print(jax.local_devices())
@@ -144,11 +157,11 @@ def train_model():
         
         # Regular batch iterator
         train_gen = batch_iterator(train, batch_size=batch_size, shuffle=True)
-        train_prefetch = prefetch_batches(train_gen, prefetch_size=32)
+        train_prefetch = prefetch_batches(train_gen,prefetch_size=2)
 
         # Regular batch iterator
         val_gen = batch_iterator(val, batch_size=batch_size, shuffle=True)
-        val_prefetch = prefetch_batches(val_gen, prefetch_size=32)
+        val_prefetch = prefetch_batches(val_gen, prefetch_size=2)
 
         # Training phase
         train_loss = []
@@ -173,7 +186,7 @@ def train_model():
         train_losses.append(loss_train)
         val_losses.append(loss_val)
 
-        print(f"Epoch {epoch+1} | Learning rate {lr_scheduler(epoch)}") 
+        print(f"Epoch {epoch+1}") 
         print(f"Train Loss: {loss_train.item():.4f}, Val Loss: {loss_val.item():.4f}")
 
     # Testing phase
@@ -234,7 +247,7 @@ def train_model():
         ax.grid(alpha=0.25)
         ax.set_yscale("log")
         fig.legend()
-        fig.savefig(f"predictions_{i}.png")
+        fig.savefig(f"LSTMpredictions_{i}.png")
         plt.close()
 
     

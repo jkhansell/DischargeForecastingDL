@@ -1,0 +1,25 @@
+Traceback (most recent call last):
+  File "/work/jovillalobos/hidrologia/DischargeForecastingDL/experiments.py", line 11, in <module>
+    LTCNTrain()
+  File "/work/jovillalobos/hidrologia/DischargeForecastingDL/experiments/LTCN_forecast.py", line 166, in train_model
+    train_prefetch = prefetch_batches(train_gen, prefetch_size=32)
+NameError: name 'prefetch_batches' is not defined
+
+ERROR conda.cli.main_run:execute(125): `conda run python experiments.py ltcn` failed. (See above for error)
+[CudaDevice(id=0)]
+
+Traceback (most recent call last):
+  File "/work/jovillalobos/hidrologia/DischargeForecastingDL/experiments.py", line 11, in <module>
+    LTCNTrain()
+  File "/work/jovillalobos/hidrologia/DischargeForecastingDL/experiments/LTCN_forecast.py", line 166, in train_model
+    train_prefetch = prefetch_batches(train_gen, prefetch_size=32)
+NameError: name 'prefetch_batches' is not defined
+
+ERROR conda.cli.main_run:execute(125): `conda run python experiments.py ltcn` failed. (See above for error)
+[CudaDevice(id=0)]
+
+srun: error: nukwa-00.cnca: task 0: Exited with exit code 1
+srun: error: nukwa-01.cnca: task 1: Exited with exit code 1
+srun: Job step aborted: Waiting up to 32 seconds for job step to finish.
+slurmstepd: error: *** JOB 237577 ON nukwa-00.cnca CANCELLED AT 2025-08-22T19:08:41 ***
+slurmstepd: error: *** STEP 237577.1 ON nukwa-00.cnca CANCELLED AT 2025-08-22T19:08:42 ***

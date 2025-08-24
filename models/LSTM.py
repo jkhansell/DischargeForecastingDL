@@ -39,7 +39,7 @@ class SeqRegressor(nn.Module):
         returns: (batch, features, quantiles)
         """
         out = nn.Dense(self.features * self.quantiles)(x)
-        return out.reshape(x.shape[0], self.features, self.quantiles)
+        return out
 
 class LSTMRegressor(nn.Module):
     features: int
@@ -49,10 +49,10 @@ class LSTMRegressor(nn.Module):
     @nn.compact
     def __call__(self, x):
         lstm = LSTM(hidden_size=self.hidden_size)
-        regressor = SeqRegressor(self.features, self.quantiles)
+        regressors = [SeqRegressor(1, self.quantiles) for _ in range(self.features)]
 
         x = lstm(x)
-        out = regressor(x[:,-1,:])
+        out = jnp.stack([regressor(x[:,-1,:]) for regressor in regressors],axis=1)
 
         return out
 
@@ -79,6 +79,7 @@ def quantile_loss_complex(
     quantiles,
     crossing_penalty_coef=0.0,
     mae_coef=0.0
+    
 ):
     """
     Flexible quantile (pinball) loss using JAX-lax conditionals for JIT stability.
@@ -95,7 +96,7 @@ def quantile_loss_complex(
     loss = jnp.mean(loss)
     # Crossing penalty
     def compute_penalty(_):
-        return jnp.mean(jnp.maximum(0, y_pred[:, :-1] - y_pred[:, 1:]))
+        return jnp.mean(jnp.maximum(0, y_pred[:, -1] - y_pred[:, 0]))
     crossing_penalty = jax.lax.cond(crossing_penalty_coef > 0.0, compute_penalty, lambda _: 0.0, operand=None)
 
     # Weighted loss
@@ -118,7 +119,7 @@ def LSTMtrain_step(state, batch, quantiles):
         preds = state.apply_fn(params, batch['x'])
         loss = quantile_loss_complex(
             preds, batch['y'], quantiles,
-            crossing_penalty_coef=0.5, mae_coef=0.5
+            crossing_penalty_coef=0.1, mae_coef=0.5
         )
         
         return loss 
@@ -149,7 +150,7 @@ def LSTMeval_step(state, batch, quantiles):
         preds = state.apply_fn(params, batch['x'])
         loss = quantile_loss_complex(
             preds, batch['y'], quantiles,
-            crossing_penalty_coef=0.5, mae_coef=0.5
+            crossing_penalty_coef=0.1, mae_coef=0.5
         )
         return loss, preds
     
