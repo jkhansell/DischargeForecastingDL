@@ -9,6 +9,8 @@ from utils.datautils import (
     batch_iterator, prefetch_batches, shard_batch, reshape_fn
 )
 
+from utils.trainingutils import quantile_loss_complex
+
 from models.LTCN import LTCNRegressor, LTCNTrainState, LTCNtrain_step, LTCNeval_step
 
 
@@ -22,13 +24,24 @@ import optax
 # Define a mapping from window suffix to temporal length (in increasing order)
 temporal_order = {
     "": 0,      # original column
-    "12h": 1,
-    "1D": 2,
-    "1W": 3,
-    "2W": 4,
-    "1M": 5,
-    "3M": 6,
-    "6M": 7
+    "2h": 1,
+    "6h" : 2,
+    "12h": 3,
+    "1D": 4,
+    "1W": 5,
+}
+
+# 15-min resolution -> integer number of rows
+windows = {
+    "2h": 8,
+    "6h" : 24,
+    "12h": 48,
+    "1D": 96,
+    "1W": 672,
+#    "2W": 1344,
+#    "1M": 2880,
+#    "3M": 8640,
+#    "6M": 17280
 }
 
 def sort_key(col):
@@ -51,24 +64,6 @@ def train_model():
     Q = get_data("./data/Q_clean.csv", sites, nan_sites)
     Q = pl.from_pandas(Q)
 
-    # Feature engineering, augmenting dataset with
-    # 1 week MA
-    # 2 week MA
-    # 1 month MA
-    # 3 month MA
-    # 6 month MA
-
-    # 15-min resolution -> integer number of rows
-    windows = {
-        "12h": 48,
-        "1D": 96,
-        "1W": 672,
-        "2W": 1344,
-        "1M": 2880,
-        "3M": 8640,
-        "6M": 17280
-    }
-
     time = Q.select("datetime")
     Q = Q.select(pl.col(pl.Float64))
     
@@ -81,6 +76,7 @@ def train_model():
                 pl.col(col).rolling_mean(window_size=value, min_periods=1).alias(f"{col}_MA_{key}")
             )
         cols[col] = i
+        
     # Add rolling means as new columns
     Q = Q.with_columns(ma_features)
     Q = Q.select(sorted(Q.columns, key=sort_key))
@@ -90,7 +86,7 @@ def train_model():
     in_stations = jnp.array([i for i in range(len(Q.columns))])
     out_stations = jnp.array([cols["08166200"]])
 
-    time_window = 32        # 16 hours of context 
+    time_window = 64            # 16 hours of context 
     horizons = (15*4*jnp.array([2, 4, 8, 16, 32]))  # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
     
     device_cpu = jax.devices("cpu")[0]

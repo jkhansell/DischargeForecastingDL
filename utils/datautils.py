@@ -84,7 +84,7 @@ def build_multi_horizon_dataset(Q, in_stations, out_stations, p, horizons):
     Parameters:
     - Q: np.array of shape (time_steps, stations)
     - in_stations: list of input station indices
-    - out_station: int, single output station index
+    - out_stations: list of output station indices
     - p: int, number of lags (time steps)
     - horizons: list of prediction horizons (steps ahead)
     - time: optional array-like of length time_steps, datetime or numeric
@@ -203,57 +203,3 @@ def reshape_fn(x):
 def shard_batch(batch):
     return jax.tree_util.tree_map(reshape_fn, batch)
 
-
-
-def boxcox_encode(x: jnp.ndarray, lam: float, eps: float = 1e-6) -> jnp.ndarray:
-    """
-    Box-Cox transformation of a positive time series.
-
-    Args:
-        x: Input array, must be > 0. Shape (B, T, F)
-        lam: Lambda parameter for Box-Cox
-        eps: small number to avoid log(0)
-
-    Returns:
-        Transformed array of same shape as x
-    """
-    x_safe = jnp.maximum(x, eps)  # avoid zeros
-    if lam == 0.0:
-        return jnp.log(x_safe)
-    else:
-        return (x_safe ** lam - 1.0) / lam
-
-
-def boxcox_decode(y: jnp.ndarray, lam: float) -> jnp.ndarray:
-    """
-    Inverse Box-Cox transformation.
-
-    Args:
-        y: Transformed array
-        lam: Lambda parameter used in encoding
-
-    Returns:
-        Original-scale array
-    """
-    if lam == 0.0:
-        return jnp.exp(y)
-    else:
-        return jnp.maximum(lam * y + 1.0, 0.0) ** (1.0 / lam)
-
-def normalize_window_features(x: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
-    """
-    Normalize each feature in each window independently using min-max scaling.
-
-    Args:
-        x: Input array, shape (Nbatches, nwindow, features)
-        eps: Small number to avoid division by zero
-
-    Returns:
-        Normalized array, same shape as x, scaled to [0,1]
-    """
-    # Compute min and max along the nwindow axis (axis=1)
-    x_min = x.min(axis=1, keepdims=True)  # shape (Nbatches, 1, features)
-    x_max = x.max(axis=1, keepdims=True)  # shape (Nbatches, 1, features)
-    
-    x_norm = (x - x_min) / (x_max - x_min + eps)
-    return x_norm
