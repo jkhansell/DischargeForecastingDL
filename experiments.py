@@ -3,6 +3,9 @@ from experiments.LTCN_forecast import train_model as LTCNTrain
 from experiments.QATN_forecast import train_model as QATNTrain
 
 import sys
+import traceback
+import os
+
 if __name__ == "__main__":
     try:
         model = sys.argv[1]
@@ -17,6 +20,7 @@ if __name__ == "__main__":
             print("no model selected")
     
     except Exception as e:
-        print(e)
-        print("Usage python experiments.py model")
+        import jax 
+        if jax.process_index() == 0:
+            traceback.print_exc()
 

@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import re
+import os
 
 from utils.datautils import (
     get_data, build_multi_horizon_dataset, 
@@ -15,13 +16,11 @@ from models.LSTM import LSTMRegressor, LSTMTrainState, LSTMtrain_step, LSTMeval_
 # import DL libraries
 import jax
 import jax.numpy as jnp
+from jax.sharding import NamedSharding, PartitionSpec as P
+from jax.experimental import multihost_utils
 import flax.linen as nn 
 from flax.jax_utils  import prefetch_to_device
 import optax
-
-import os
-node_id = os.environ['SLURM_NODEID']
-visible_devices = [int(gpu) for gpu in os.environ['CUDA_VISIBLE_DEVICES'].split(',')]
 
 # Define a mapping from window suffix to temporal length (in increasing order)
 temporal_order = {
@@ -63,9 +62,6 @@ import polars as pl
 
 def train_model():
 
-    # booster nodes use 4 GPUs per machine.
-    jax.distributed.initialize(local_device_ids=visible_devices)
-
     Q = get_data("./data/Q_clean.csv", sites, nan_sites)
     Q = pl.from_pandas(Q)   
 
@@ -74,7 +70,6 @@ def train_model():
 
     # Create a new DataFrame for all new features
     ma_features = []
-    diff_features = []
     cols = {}
     for i,col in enumerate(Q.columns):
         for key, value in windows.items():
@@ -89,26 +84,61 @@ def train_model():
 
     # build lagged dataset
 
-    in_stations = jnp.array([i for i in range(len(Q.columns))])
-    out_stations = jnp.array([cols["08166200"]])
+    in_stations = np.array([i for i in range(len(Q.columns))])
+    out_stations = np.array([cols["08166200"]])
 
     time_window = 64        # 16 hours of context 
-    horizons = (15*4*jnp.array([2, 4, 8, 16, 32]))  # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
+    horizons = (15*4*np.array([2, 4, 8, 16, 32]))  # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
 
-    device_cpu = jax.devices("cpu")[0]
-    Q_cpu = jax.device_put(Q.to_numpy(), device=device_cpu)
+    Q_cpu = Q.to_numpy()
 
-    # compiling function for CPU
     X, Y, Y_idx = build_multi_horizon_dataset(Q_cpu, in_stations, out_stations, time_window, horizons)
+    X = np.log10(X)
+    Y = np.log10(Y)
 
-    X = jnp.log10(X)
-    Y = jnp.log10(Y)
+    # initialize distributed environment
+    visible_devices = [int(gpu) for gpu in os.environ['CUDA_VISIBLE_DEVICES'].split(',')]          
 
-    # make batches 
-    batch_size = 128*jax.device_count()
+    jax.distributed.initialize(
+        local_device_ids=visible_devices
+    )
+
+    print(f"[JAX] ProcID: {jax.process_index()}")
+    print(f"[JAX] Local devices: {jax.local_devices()}")
+    print(f"[JAX] Global devices: {jax.devices()}")
     
-    train, val, test, times = create_train_val_test(X, Y, time)
+    num_devices = len(jax.local_devices())
+    per_device_batch_size = 128  # batch size per device
+    batch_size = per_device_batch_size * num_devices  # total batch across all devices
+
+    total_rows = X.shape[0]
+
+    # number of full batches we can create
+    num_full_batches = total_rows // batch_size
+
+    # optionally trim X so it contains only full batches
+    valid_rows = num_full_batches * batch_size
+    rows_per_device = valid_rows // jax.process_count()
+
+    X = X[:valid_rows]
+    Y = Y[:valid_rows]
+
+    # Devices
+    n_local_devices = jax.local_device_count()   # 4 GPUs per host
+    n_total_devices = jax.device_count()         # 8 total
+    print(f"Host {jax.process_index()} sees {n_local_devices} local devices")
+
+    # Each host keeps only its slice
+    host_index = jax.process_index()
+    start = host_index * rows_per_device
+    end   = (host_index + 1) * rows_per_device
     
+    X_local = X[start:end]
+    Y_local = Y[start:end]
+    
+    train, val, test, times = create_train_val_test(X_local, Y_local, time)
+   
+    print(X_local.shape)
     num_epochs = 35
 
     in_features = X.shape[-1]
@@ -126,7 +156,7 @@ def train_model():
     # Training setup
     steps_per_epoch = len(train["x"]) // batch_size
     total_steps = num_epochs * steps_per_epoch
-    warmup_steps = 300
+    warmup_steps = 50
 
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=1e-6,          # very small start
@@ -147,11 +177,10 @@ def train_model():
     train_step = LSTMtrain_step(loss_fn)
     eval_step = LSTMeval_step(loss_fn)
 
-    print(jax.devices())``
     # training using data parallelism
     p_LSTMtrain_step = jax.pmap(train_step, axis_name="batch")
     p_LSTMeval_step = jax.pmap(eval_step, axis_name="batch")
-    state = jax.device_put_replicated(state, jax.devices())
+    state = jax.device_put_replicated(state, jax.local_devices())
 
     train_losses = []
     val_losses = []
@@ -160,7 +189,7 @@ def train_model():
         
         # Regular batch iterator
         train_gen = batch_iterator(train, batch_size=batch_size, shuffle=True)
-        train_prefetch = prefetch_batches(train_gen,prefetch_size=2)
+        train_prefetch = prefetch_batches(train_gen, prefetch_size=2)
 
         # Regular batch iterator
         val_gen = batch_iterator(val, batch_size=batch_size, shuffle=True)
@@ -189,8 +218,9 @@ def train_model():
         train_losses.append(loss_train)
         val_losses.append(loss_val)
 
-        print(f"Epoch {epoch+1}")
-        print(f"Train Loss: {loss_train.item():.4f}, Val Loss: {loss_val.item():.4f}")
+        if jax.process_index() == 0:
+            print(f"Epoch {epoch+1}")
+            print(f"Train Loss: {loss_train.item():.4f}, Val Loss: {loss_val.item():.4f}")
 
     # Testing phase
     test_gen = batch_iterator(test, batch_size=batch_size, shuffle=False)

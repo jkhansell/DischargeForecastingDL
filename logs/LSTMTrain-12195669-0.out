@@ -1,9 +1,0 @@
-INVALID_ARGUMENT: Cannot copy array to non-addressable device: TFRT_CPU_0
-Usage python experiments.py model
-
-2025-08-26 19:09:58.949946: W external/xla/xla/service/gpu/autotuning/dot_search_space.cc:200] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs?Working around this by using the full hints set instead.
-
-[CudaDevice(id=0), CudaDevice(id=1), CudaDevice(id=2), CudaDevice(id=3)]
-INVALID_ARGUMENT: Cannot copy array to non-addressable device: cuda:4
-Usage python experiments.py model
-

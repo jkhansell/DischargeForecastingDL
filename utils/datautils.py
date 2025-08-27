@@ -96,11 +96,11 @@ def build_multi_horizon_dataset(Q, in_stations, out_stations, p, horizons):
     """
     time_steps, num_stations = Q.shape
 
-    max_start = time_steps - p - jnp.max(horizons) + 1
-    start_indices = jnp.arange(max_start)
+    max_start = time_steps - p - np.max(horizons) + 1
+    start_indices = np.arange(max_start)
 
-    lag_indices = jnp.arange(p)
-    horizons = jnp.array(horizons)
+    lag_indices = np.arange(p)
+    horizons = np.array(horizons)
 
     X_idx = start_indices[:, None] + lag_indices[None, :]
     Y_idx = X_idx[:, -1][:, None] + horizons[None, :]
@@ -197,7 +197,7 @@ def reshape_fn(x):
     if remainder > 0:
         # repeat first few examples to pad
         pad_width = n_devices - remainder
-        x = np.concatenate([x, x[:pad_width]], axis=0)
+        x = jnp.concatenate([x, x[:pad_width]], axis=0)
     return x.reshape(n_devices, -1, *x.shape[1:])
 
 def shard_batch(batch):
