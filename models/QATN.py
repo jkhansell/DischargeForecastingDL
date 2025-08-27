@@ -3,10 +3,6 @@ import jax.numpy as jnp
 
 import flax.linen as nn
 from flax.training import train_state
-
-
-from utils.trainingutils import dilate_loss, quantile_loss
-
 from typing import Any, Callable, Tuple
 
 def causal_mask(T: int):
@@ -21,7 +17,7 @@ class MLPBlock(nn.Module):
     def __call__(self, x):
         y = nn.LayerNorm()(x)
         y = nn.Dense(4 * self.hidden_size)(y)
-        y = nn.gelu(y)
+        y = nn.relu(y)
         y = nn.Dense(self.hidden_size)(y)
         return x + y
 

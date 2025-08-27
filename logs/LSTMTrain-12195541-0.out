@@ -1,0 +1,18 @@
+Traceback (most recent call last):
+  File "/p/project1/ehrtas/villalobos1/RiverSimCR/rainfall_analysis/DischargeForecastingDL/experiments.py", line 1, in <module>
+    from experiments.LSTM_forecast import train_model as LSTMTrain
+  File "/p/project1/ehrtas/villalobos1/RiverSimCR/rainfall_analysis/DischargeForecastingDL/experiments/LSTM_forecast.py", line 24, in <module>
+    node_id = os.environ['SLURM_NODEID']
+NameError: name 'os' is not defined
+
+Traceback (most recent call last):
+  File "/p/project1/ehrtas/villalobos1/RiverSimCR/rainfall_analysis/DischargeForecastingDL/experiments.py", line 1, in <module>
+    from experiments.LSTM_forecast import train_model as LSTMTrain
+  File "/p/project1/ehrtas/villalobos1/RiverSimCR/rainfall_analysis/DischargeForecastingDL/experiments/LSTM_forecast.py", line 24, in <module>
+    node_id = os.environ['SLURM_NODEID']
+NameError: name 'os' is not defined
+
+ERROR conda.cli.main_run:execute(125): `conda run python experiments.py lstm` failed. (See above for error)
+ERROR conda.cli.main_run:execute(125): `conda run python experiments.py lstm` failed. (See above for error)
+srun: error: jwb0761: task 1: Exited with exit code 1
+srun: error: jwb0738: task 0: Exited with exit code 1

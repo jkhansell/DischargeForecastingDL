@@ -8,9 +8,9 @@ from utils.datautils import (
     get_discharges, create_train_val_test,
     batch_iterator, prefetch_batches, shard_batch, reshape_fn
 )
+from utils.trainingutils import quantile_loss_complex, cosine_annealing
 
 from models.LSTM import LSTMRegressor, LSTMTrainState, LSTMtrain_step, LSTMeval_step
-
 
 # import DL libraries
 import jax
@@ -19,16 +19,31 @@ import flax.linen as nn
 from flax.jax_utils  import prefetch_to_device
 import optax
 
+import os
+node_id = os.environ['SLURM_NODEID']
+visible_devices = [int(gpu) for gpu in os.environ['CUDA_VISIBLE_DEVICES'].split(',')]
+
 # Define a mapping from window suffix to temporal length (in increasing order)
 temporal_order = {
     "": 0,      # original column
-    "12h": 1,
-    "1D": 2,
-    "1W": 3,
-    "2W": 4,
-    "1M": 5,
-    "3M": 6,
-    "6M": 7
+    "2h": 1,
+    "6h" : 2,
+    "12h": 3,
+    "1D": 4,
+    "1W": 5,
+}
+
+# 15-min resolution -> integer number of rows
+windows = {
+    "2h": 8,
+    "6h" : 24,
+    "12h": 48,
+    "1D": 96,
+    "1W": 672,
+#    "2W": 1344,
+#    "1M": 2880,
+#    "3M": 8640,
+#    "6M": 17280
 }
 
 def sort_key(col):
@@ -37,7 +52,6 @@ def sort_key(col):
     station, suffix = m.groups()
     # Map suffix to temporal order
     return (station, temporal_order.get(suffix, 99))
-
 
 ## We'll be studying the Guadalupe River in Kerr County, TX the USGS sites are the following
 # Previously exploring the data some stations report the discharge variable in another column of the data frame
@@ -48,39 +62,27 @@ nan_sites = ["08166140", "08166200"]
 import polars as pl
 
 def train_model():
+
+    # booster nodes use 4 GPUs per machine.
+    jax.distributed.initialize(local_device_ids=visible_devices)
+
     Q = get_data("./data/Q_clean.csv", sites, nan_sites)
-    Q = pl.from_pandas(Q)
-
-    # Feature engineering, augmenting dataset with
-    # 1 week MA
-    # 2 week MA
-    # 1 month MA
-    # 3 month MA
-    # 6 month MA
-
-    # 15-min resolution -> integer number of rows
-    windows = {
-        "12h": 48,
-        "1D": 96,
-        "1W": 672,
-        "2W": 1344,
-        "1M": 2880,
-        "3M": 8640,
-        "6M": 17280
-    }
+    Q = pl.from_pandas(Q)   
 
     time = Q.select("datetime")
     Q = Q.select(pl.col(pl.Float64))
-    
+
     # Create a new DataFrame for all new features
     ma_features = []
+    diff_features = []
     cols = {}
     for i,col in enumerate(Q.columns):
         for key, value in windows.items():
             ma_features.append(
-                pl.col(col).rolling_mean(window_size=value, min_periods=1).alias(f"{col}_MA_{key}")
+                pl.col(col).rolling_median(window_size=value, min_samples=1).alias(f"{col}_MA_{key}")
             )
         cols[col] = i
+
     # Add rolling means as new columns
     Q = Q.with_columns(ma_features)
     Q = Q.select(sorted(Q.columns, key=sort_key))
@@ -90,33 +92,30 @@ def train_model():
     in_stations = jnp.array([i for i in range(len(Q.columns))])
     out_stations = jnp.array([cols["08166200"]])
 
-    time_window = 32        # 16 hours of context 
+    time_window = 64        # 16 hours of context 
     horizons = (15*4*jnp.array([2, 4, 8, 16, 32]))  # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
-    
+
     device_cpu = jax.devices("cpu")[0]
     Q_cpu = jax.device_put(Q.to_numpy(), device=device_cpu)
 
     # compiling function for CPU
     X, Y, Y_idx = build_multi_horizon_dataset(Q_cpu, in_stations, out_stations, time_window, horizons)
-    time = time.to_numpy()[Y_idx]
 
     X = jnp.log10(X)
     Y = jnp.log10(Y)
 
     # make batches 
-    batch_size = 64
+    batch_size = 128*jax.device_count()
     
-    assert batch_size % jax.local_device_count() == 0
-
     train, val, test, times = create_train_val_test(X, Y, time)
     
-    num_epochs = 30
+    num_epochs = 35
 
     in_features = X.shape[-1]
     out_features = Y.shape[-2]
-    hidden_size = 32
+    hidden_size = 64
     quantiles = jnp.array([0.05, 0.5, 0.95])
-    quantiles_b = jnp.broadcast_to(quantiles, (jax.local_device_count(),) + quantiles.shape)
+    quantiles_b = jnp.broadcast_to(quantiles, (jax.device_count(),) + quantiles.shape)
     
     key = jax.random.PRNGKey(123)
     x = jnp.zeros((batch_size, time_window, in_features))
@@ -124,31 +123,35 @@ def train_model():
     model = LSTMRegressor(features=out_features, quantiles=len(quantiles), hidden_size=hidden_size)
     params = model.init(key, x)
 
-
     # Training setup
     steps_per_epoch = len(train["x"]) // batch_size
     total_steps = num_epochs * steps_per_epoch
-    warmup_steps = 150
-
-    print(total_steps)
+    warmup_steps = 300
 
     schedule = optax.warmup_cosine_decay_schedule(
-        init_value=1e-5,          # very small start
-        peak_value=8e-4,          # max LR (after warmup)
+        init_value=1e-6,          # very small start
+        peak_value=1e-4,          # max LR (after warmup)
         warmup_steps=warmup_steps,
         decay_steps=total_steps-warmup_steps,  # decay until end of training
         end_value=1e-6            # LR at final step (lower = steeper decay)
     )
-
-    tx = optax.adamw(learning_rate=schedule, weight_decay=1e-5)
     
+    tx = optax.adamw(learning_rate=schedule, weight_decay=1e-5)
+
     state = LSTMTrainState.create(apply_fn=model.apply, params=params,tx=tx)
 
-    print(jax.local_devices())
+    loss_fn = lambda x,y: quantile_loss_complex(
+        x, y, quantiles, crossing_penalty_coef=0.2
+    )
+
+    train_step = LSTMtrain_step(loss_fn)
+    eval_step = LSTMeval_step(loss_fn)
+
+    print(jax.devices())``
     # training using data parallelism
-    p_LSTMtrain_step = jax.pmap(LSTMtrain_step, axis_name="batch")
-    p_LSTMeval_step = jax.pmap(LSTMeval_step, axis_name="batch")
-    state = jax.device_put_replicated(state, jax.local_devices())
+    p_LSTMtrain_step = jax.pmap(train_step, axis_name="batch")
+    p_LSTMeval_step = jax.pmap(eval_step, axis_name="batch")
+    state = jax.device_put_replicated(state, jax.devices())
 
     train_losses = []
     val_losses = []
@@ -169,13 +172,13 @@ def train_model():
 
         for batch in train_prefetch:
             batch = shard_batch(batch)
-            state, loss = p_LSTMtrain_step(state, batch, quantiles_b)
+            state, loss = p_LSTMtrain_step(state, batch)
             train_loss.append(loss)
 
         # Validation phase
         for batch in val_prefetch:
             batch = shard_batch(batch)
-            loss, _ = p_LSTMeval_step(state, batch, quantiles_b)
+            loss, _ = p_LSTMeval_step(state, batch)
             val_loss.append(loss)
 
         # Compute epoch averages
@@ -186,7 +189,7 @@ def train_model():
         train_losses.append(loss_train)
         val_losses.append(loss_val)
 
-        print(f"Epoch {epoch+1}") 
+        print(f"Epoch {epoch+1}")
         print(f"Train Loss: {loss_train.item():.4f}, Val Loss: {loss_val.item():.4f}")
 
     # Testing phase
@@ -201,7 +204,7 @@ def train_model():
         
     for batch in test_prefetch:
         batch = shard_batch(batch)
-        loss, preds = p_LSTMeval_step(state, batch, quantiles_b)
+        loss, preds = p_LSTMeval_step(state, batch)
         test_loss.append(np.mean(loss))
         
         # append for graphing
@@ -210,12 +213,11 @@ def train_model():
         medians.append(preds[..., 1].reshape(-1, preds.shape[2]))
         highs.append(preds[..., 2].reshape(-1, preds.shape[2]))
 
-    medians = np.concatenate(medians, axis=0)
-    lows = np.concatenate(lows, axis=0)
-    highs = np.concatenate(highs, axis=0)
-    truths = np.concatenate(truths, axis=0)
-
-    test_loss = np.array(test_loss).flatten()
+    medians = np.concatenate(medians, axis=0).astype(np.float32)
+    lows = np.concatenate(lows, axis=0).astype(np.float32)
+    highs = np.concatenate(highs, axis=0).astype(np.float32)
+    truths = np.concatenate(truths, axis=0).astype(np.float32)
+    test_loss = np.array(test_loss).flatten().astype(np.float32)
 
     # plot losses
 
@@ -225,6 +227,7 @@ def train_model():
     ax.set_xlabel("Epochs")
     ax.set_ylabel("Loss")
     ax.grid(alpha=0.25, which="both")
+    ax.set_yscale("log")
     fig.legend()
     fig.savefig("LSTM_Loss.png")
     plt.close()
@@ -239,9 +242,9 @@ def train_model():
 
     for i in range(medians.shape[1]):
         fig, ax = plt.subplots(figsize=(12,5))
+        ax.plot(10**truths[:,i],  label="Ground Truth")
         ax.plot(10**medians[:,i], label="Median")
-        ax.fill_between(np.arange(lows[:,i].shape[0]), 10**lows[:,i], 10**highs[:,i], alpha=0.25, label="Quantiles = [0.1,0.9]")
-        ax.plot(10**truths[:,i], label="Ground Truth")
+        ax.fill_between(np.arange(lows[:,i].shape[0]), 10**lows[:,i], 10**highs[:,i], alpha=0.25, label="Quantiles = [0.05,0.95]")
         ax.set_xlabel("Time point")
         ax.set_ylabel("Flow Discharge [m^3/s]")
         ax.grid(alpha=0.25)
@@ -249,5 +252,6 @@ def train_model():
         fig.legend()
         fig.savefig(f"LSTMpredictions_{i}.png")
         plt.close()
-
+    
+    jax.distributed.shutdown()
     

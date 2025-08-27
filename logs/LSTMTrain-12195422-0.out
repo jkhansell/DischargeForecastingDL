@@ -1,0 +1,81 @@
+2025-08-26 18:41:56.245195: W external/xla/xla/service/gpu/autotuning/dot_search_space.cc:200] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs?Working around this by using the full hints set instead.
+2025-08-26 18:42:04.736449: W external/xla/xla/service/gpu/autotuning/dot_search_space.cc:200] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs?Working around this by using the full hints set instead.
+2025-08-26 18:42:04.749238: W external/xla/xla/service/gpu/autotuning/dot_search_space.cc:200] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs?Working around this by using the full hints set instead.
+2025-08-26 18:42:04.749305: W external/xla/xla/service/gpu/autotuning/dot_search_space.cc:200] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs?Working around this by using the full hints set instead.
+2025-08-26 18:43:02.543003: W external/xla/xla/service/gpu/autotuning/dot_search_space.cc:200] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs?Working around this by using the full hints set instead.
+2025-08-26 18:43:02.543106: W external/xla/xla/service/gpu/autotuning/dot_search_space.cc:200] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs?Working around this by using the full hints set instead.
+2025-08-26 18:43:12.496896: W external/xla/xla/service/gpu/autotuning/dot_search_space.cc:200] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs?Working around this by using the full hints set instead.
+2025-08-26 18:43:19.748736: W external/xla/xla/service/gpu/autotuning/dot_search_space.cc:200] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs?Working around this by using the full hints set instead.
+
+[CudaDevice(id=0), CudaDevice(id=1), CudaDevice(id=2), CudaDevice(id=3)]
+Epoch 1
+Train Loss: 0.5878, Val Loss: 0.5582
+Epoch 2
+Train Loss: 0.4902, Val Loss: 0.4542
+Epoch 3
+Train Loss: 0.4040, Val Loss: 0.3819
+Epoch 4
+Train Loss: 0.3349, Val Loss: 0.3125
+Epoch 5
+Train Loss: 0.2728, Val Loss: 0.2521
+Epoch 6
+Train Loss: 0.2216, Val Loss: 0.2037
+Epoch 7
+Train Loss: 0.1804, Val Loss: 0.1646
+Epoch 8
+Train Loss: 0.1474, Val Loss: 0.1318
+Epoch 9
+Train Loss: 0.1222, Val Loss: 0.1083
+Epoch 10
+Train Loss: 0.1058, Val Loss: 0.0928
+Epoch 11
+Train Loss: 0.0952, Val Loss: 0.0829
+Epoch 12
+Train Loss: 0.0880, Val Loss: 0.0761
+Epoch 13
+Train Loss: 0.0827, Val Loss: 0.0709
+Epoch 14
+Train Loss: 0.0784, Val Loss: 0.0670
+Epoch 15
+Train Loss: 0.0750, Val Loss: 0.0636
+Epoch 16
+Train Loss: 0.0721, Val Loss: 0.0608
+Epoch 17
+Train Loss: 0.0696, Val Loss: 0.0584
+Epoch 18
+Train Loss: 0.0676, Val Loss: 0.0564
+Epoch 19
+Train Loss: 0.0658, Val Loss: 0.0547
+Epoch 20
+Train Loss: 0.0643, Val Loss: 0.0531
+Epoch 21
+Train Loss: 0.0630, Val Loss: 0.0519
+Epoch 22
+Train Loss: 0.0620, Val Loss: 0.0507
+Epoch 23
+Train Loss: 0.0612, Val Loss: 0.0499
+Epoch 24
+Train Loss: 0.0607, Val Loss: 0.0492
+Epoch 25
+Train Loss: 0.0602, Val Loss: 0.0487
+Epoch 26
+Train Loss: 0.0599, Val Loss: 0.0483
+Epoch 27
+Train Loss: 0.0596, Val Loss: 0.0481
+Epoch 28
+Train Loss: 0.0594, Val Loss: 0.0478
+Epoch 29
+Train Loss: 0.0592, Val Loss: 0.0476
+Epoch 30
+Train Loss: 0.0592, Val Loss: 0.0475
+Epoch 31
+Train Loss: 0.0591, Val Loss: 0.0475
+Epoch 32
+Train Loss: 0.0591, Val Loss: 0.0474
+Epoch 33
+Train Loss: 0.0591, Val Loss: 0.0474
+Epoch 34
+Train Loss: 0.0591, Val Loss: 0.0474
+Epoch 35
+Train Loss: 0.0590, Val Loss: 0.0474
+

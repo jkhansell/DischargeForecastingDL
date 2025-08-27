@@ -7,13 +7,14 @@ from utils.datautils import (
     get_data, build_multi_horizon_dataset, 
     get_discharges, create_train_val_test,
     batch_iterator, prefetch_batches, shard_batch, reshape_fn,
-    boxcox_decode, boxcox_encode
 )
 
 from utils.trainingutils import cosine_annealing
 
-from models.QATN import QATNRegressor, QATNTrainState, QATNtrain_step, QATNeval_step
-
+from models.QATN import (
+    QATNRegressor, QATNTrainState, 
+    QATNtrain_step, QATNeval_step
+)
 
 # import DL libraries
 import jax
@@ -21,18 +22,28 @@ import jax.numpy as jnp
 import flax.linen as nn 
 import optax
 
-
 # Define a mapping from window suffix to temporal length (in increasing order)
 temporal_order = {
     "": 0,      # original column
-    "3h": 1,
-    "6h": 2,
+    "2h": 1,
+    "6h" : 2,
     "12h": 3,
     "1D": 4,
     "1W": 5,
-    "2W": 6,
 }
 
+# 15-min resolution -> integer number of rows
+windows = {
+    "2h": 8,
+    "6h" : 24,
+    "12h": 48,
+    "1D": 96,
+    "1W": 672,
+#    "2W": 1344,
+#    "1M": 2880,
+#    "3M": 8640,
+#    "6M": 17280
+}
 def sort_key(col):
     # Match the station name and optional MA suffix
     m = re.match(r"(\d+)(?:_MA_)?(.*)", col)

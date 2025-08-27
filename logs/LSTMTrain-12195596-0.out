@@ -1,0 +1,6 @@
+jax.distributed.initialize() must be called before any JAX calls that might initialise the XLA backend. This includes any computation, but also calls to jax.devices, jax.device_put, and others.
+Usage python experiments.py model
+
+jax.distributed.initialize() must be called before any JAX calls that might initialise the XLA backend. This includes any computation, but also calls to jax.devices, jax.device_put, and others.
+Usage python experiments.py model
+
