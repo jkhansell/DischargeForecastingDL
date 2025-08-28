@@ -57,7 +57,7 @@ class LSTMRegressor(nn.Module):
         x = lstm(x)
         out = jnp.stack([regressor(x[:,-1,:]) for regressor in regressors],axis=1)
 
-        return out
+        return out.astype(jnp.float32)
 
 class LSTMTrainState(train_state.TrainState):
     pass

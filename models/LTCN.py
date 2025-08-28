@@ -9,56 +9,72 @@ class LTCNCell(nn.Module):
     hidden_size: int
     dt: float
     activation: Callable = nn.tanh
+    compute_dtype: jnp.dtype = jnp.bfloat16  # for forward/backward computations
 
     @nn.compact
     def __call__(self, carry, inputs):
-        h = carry  # shape (hidden_size,)
+        # --- Cast carry and inputs to compute_dtype ---
+        h = carry.astype(self.compute_dtype)
+        inputs = inputs.astype(self.compute_dtype)
         input_dim = inputs.shape[-1]
 
-        gamma = self.param("gamma", nn.initializers.xavier_uniform(),
-                           (input_dim, self.hidden_size))
-        gamma_r = self.param("gamma_r", nn.initializers.xavier_uniform(),
-                             (self.hidden_size, self.hidden_size))
-        mu = self.param("mu", nn.initializers.uniform(),
-                        (self.hidden_size,))
-        A = self.param("A", nn.initializers.uniform(),
-                       (self.hidden_size,))
-        tau = self.param("tau", nn.initializers.constant(1.0),
-                         (self.hidden_size,))
+        # --- Parameters (float32 for stability) ---
+        gamma = self.param("gamma", nn.initializers.xavier_uniform(), (input_dim, self.hidden_size))
+        gamma_r = self.param("gamma_r", nn.initializers.xavier_uniform(), (self.hidden_size, self.hidden_size))
+        mu = self.param("mu", nn.initializers.uniform(), (self.hidden_size,))
+        A = self.param("A", nn.initializers.uniform(), (self.hidden_size,))
+        tau = self.param("tau", nn.initializers.constant(1.0), (self.hidden_size,))
+
+        # --- Cast parameters to compute_dtype for computation ---
+        gamma_bf16 = gamma.astype(self.compute_dtype)
+        gamma_r_bf16 = gamma_r.astype(self.compute_dtype)
+        mu_bf16 = mu.astype(self.compute_dtype)
+        A_bf16 = A.astype(self.compute_dtype)
+        tau_bf16 = tau.astype(self.compute_dtype)
 
         # --- Encode input ---
-        I_t = jnp.dot(inputs, gamma)            # (hidden_size,)
-        x_t = jnp.dot(h, gamma_r) + mu              # (hidden_size,)
+        I_t = jnp.dot(inputs, gamma_bf16)            # (hidden_size,)
+        x_t = jnp.dot(h, gamma_r_bf16) + mu_bf16     # (hidden_size,)
 
         # --- Nonlinearity ---
         f = self.activation(x_t + I_t)
 
         # --- Liquid time-constant integration ---
-        x_tp1 = (x_t + self.dt * f * A) / (1 + self.dt * (1 / tau + f))
+        x_tp1 = (x_t + self.dt * f * A_bf16) / (1 + self.dt * (1 / tau_bf16 + f))
 
         return x_tp1, x_tp1
 
 class LTCN(nn.Module):
     hidden_size: int
+    dtype: jnp.dtype = jnp.bfloat16  # compute_dtype
+
     @nn.compact
     def __call__(self, x, dt):
         B, T, D = x.shape
-        h0 = jnp.zeros((B, self.hidden_size))
+        # Initial hidden state in compute_dtype
+        h0 = jnp.zeros((B, self.hidden_size), dtype=self.dtype)
 
+        # Wrap LTCNCell in a scan over the time axis
         ltcn_scan = nn.scan(
             LTCNCell, 
-            variable_broadcast="params",
+            variable_broadcast="params",   # parameters are shared across time
             split_rngs={"params": False},
-            in_axes=1,    # time axis in input
-            out_axes=1    # keep time axis in outputs
-        )(self.hidden_size, dt, name="ltcn_cell")
-    
+            in_axes=1,                     # scan over time axis
+            out_axes=1                     # keep time axis in outputs
+        )(
+            hidden_size=self.hidden_size,
+            dt=dt,
+            compute_dtype=self.dtype,      # AMP: computation dtype
+            name="ltcn_cell"
+        )
+
         x_final, outputs = ltcn_scan(h0, x)
         return outputs
 
 class SeqRegressor(nn.Module):
     features: int
     quantiles: int
+    dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
     def __call__(self, x):
@@ -66,7 +82,7 @@ class SeqRegressor(nn.Module):
         x: (batch, features)
         returns: (batch, features, quantiles)
         """
-        out = nn.Dense(self.features * self.quantiles)(x)
+        out = nn.Dense(self.features * self.quantiles, dtype=self.dtype)(x)
         return out
 
 class LTCNRegressor(nn.Module):
@@ -74,107 +90,76 @@ class LTCNRegressor(nn.Module):
     quantiles: int
     hidden_size: int
     dt: float
+    dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
     def __call__(self, x):
         ltcn = LTCN(hidden_size=self.hidden_size)
-        regressors = [SeqRegressor(1, self.quantiles) for _ in range(self.features)]  
+        regressors = [SeqRegressor(1, self.quantiles, self.dtype) for _ in range(self.features)]  
 
         x = ltcn(x, self.dt)
 
         out = jnp.stack([regressor(x[:,-1,:]) for regressor in regressors],axis=1)
 
-        #out = regressor(x[:,-1,:])
-
-        return out
+        return out.astype(jnp.float32)
 
 class LTCNTrainState(train_state.TrainState):
     pass
 
+def LTCNtrain_step(userloss):
+    @jax.jit
+    def func(state, batch, *args, **kwargs):
+        """
+        state: TrainState
+        batch: dict with "x" and "y"
+            x: (batch, time, input_features)
+            y: (batch, features)
+        """
+        def loss_fn(params):
+            preds = state.apply_fn(params, batch['x'])
+            loss = userloss(
+                preds, batch['y'], *args, **kwargs
+            )
+            
+            return loss 
 
-@jax.jit
-def quantile_loss_complex(
-    y_pred,
-    y_true,
-    quantiles,
-    crossing_penalty_coef=0.0,
-    mae_coef=0.0
-):
-    """
-    Flexible quantile (pinball) loss using JAX-lax conditionals for JIT stability.
-    """
+        # Get both loss and gradients
+        loss, grads = jax.value_and_grad(loss_fn)(state.params)
+        grads = jax.tree_util.tree_map(
+            lambda g: jax.lax.pmean(g, axis_name="batch"), grads
+        )
 
-    # Ensure y_true is (Nstations, 1)
-
-    # Error across all quantiles
-    error = y_true - y_pred  # (Nstations, Nquantiles)
-    mae = jnp.mean(jnp.abs(y_true - y_pred[..., y_pred.shape[-1]//2, None]))
-
-    # Pinball loss
-    loss = jnp.maximum(quantiles * error, (quantiles - 1) * error)  # (Nstations, Nquantiles)
-    loss = jnp.mean(loss)
-    # Crossing penalty
-    def compute_penalty(_):
-        return jnp.mean(jnp.maximum(0, y_pred[:, :-1] - y_pred[:, 1:]))
-    crossing_penalty = jax.lax.cond(crossing_penalty_coef > 0.0, compute_penalty, lambda _: 0.0, operand=None)
-
-    # Combine
-    total_loss = loss + crossing_penalty_coef * crossing_penalty + mae_coef * mae
-
-    # Return either per-quantile or total
-    return total_loss
-
-
-@jax.jit
-def LTCNtrain_step(state, batch, quantiles):
-    """
-    state: TrainState
-    batch: dict with "x" and "y"
-        x: (batch, time, input_features)
-        y: (batch, features)
-    """
-    def loss_fn(params):
-        preds = state.apply_fn(params, batch['x'])
-        loss = quantile_loss_complex(
-            preds, batch['y'], quantiles,
-            crossing_penalty_coef=0.0, mae_coef=1.0
+        # Update state
+        state = state.apply_gradients(grads=grads)
+        loss = jax.tree_util.tree_map(
+            lambda x: jax.lax.pmean(x, axis_name="batch"), loss
         )
         
-        return loss 
+        return state, loss
+    return func
 
-    # Get both loss and gradients
-    loss, grads = jax.value_and_grad(loss_fn)(state.params)
-    grads = jax.tree_util.tree_map(
-        lambda g: jax.lax.pmean(g, axis_name="batch"), grads
-    )
 
-    # Update state
-    state = state.apply_gradients(grads=grads)
-    loss = jax.tree_util.tree_map(
-        lambda x: jax.lax.pmean(x, axis_name="batch"), loss
-    )
-    
-    return state, loss
-
-@jax.jit
-def LTCNeval_step(state, batch, quantiles):
-    """
-    state: TrainState
-    batch: dict with "x" and "y"
-        x: (batch, time, input_features)
-        y: (batch, features)
-    """
-    def loss_fn(params):
-        preds = state.apply_fn(params, batch['x'])
-        loss = quantile_loss_complex(
-            preds, batch['y'], quantiles,
-            crossing_penalty_coef=0.0, mae_coef=1.0
+def LTCNeval_step(userloss):
+    @jax.jit
+    def func(state, batch, *args, **kwargs):
+        """
+        state: TrainState
+        batch: dict with "x" and "y"
+            x: (batch, time, input_features)
+            y: (batch, features)
+        """
+        def loss_fn(params):
+            preds = state.apply_fn(params, batch['x'])
+            loss = userloss(
+                preds, batch['y'], *args, **kwargs,
+            )
+            return loss, preds
+        
+        loss, preds = loss_fn(state.params)
+        loss = jax.tree_util.tree_map(
+            lambda x: jax.lax.pmean(x, axis_name="batch"), loss
         )
         return loss, preds
-    
-    loss, preds = loss_fn(state.params)
-    loss = jax.tree_util.tree_map(
-        lambda x: jax.lax.pmean(x, axis_name="batch"), loss
-    )
-    return loss, preds
+    return func
+
     

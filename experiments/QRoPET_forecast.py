@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+from datetime import datetime
 import matplotlib.pyplot as plt
 import re
 import os
@@ -17,7 +18,7 @@ from utils.trainingutils import (
     ModelTrainState
 )
 
-from models.QATN import QATNRegressor
+from models.QRoPET import QRoPETRegressor
 
 # import DL libraries
 import jax
@@ -27,7 +28,6 @@ from jax.experimental import multihost_utils
 import flax.linen as nn 
 from flax.jax_utils  import prefetch_to_device
 import optax
-
 
 # logging
 import logging, sys
@@ -40,6 +40,9 @@ logging.basicConfig(
 
 logger = logging.getLogger()
 
+# model parameter saving
+import orbax.checkpoint
+from flax.training import orbax_utils
 
 # Define a mapping from window suffix to temporal length (in increasing order)
 temporal_order = {
@@ -85,10 +88,19 @@ import polars as pl
 def train_model():
     Q = get_data("./data/Q_clean.csv", sites, nan_sites)
     Q = pl.from_pandas(Q)
-
+    # Convert string column to Polars datetime
+    
     time = Q.select("datetime")
+    time = time["datetime"].str.to_datetime("%Y-%m-%d %H:%M:%S%z")
+
     Q = Q.select(pl.col(pl.Float64))
     
+    Q = Q.select([
+        pl.col(c).log10().alias(c)
+        for c in Q.columns 
+    ])
+
+
     # Create a new DataFrame for all new features
     ma_features = []
     cols = {}
@@ -102,6 +114,8 @@ def train_model():
     # Add rolling means as new columns
     Q = Q.with_columns(ma_features)
     Q = Q.select(sorted(Q.columns, key=sort_key))
+
+    # Add temporal sinusoidal encoding to data 
     Q = Q.with_columns([
         (2 * np.pi * time.dt.hour() / 24).sin().alias("hour_sin"),
         (2 * np.pi * time.dt.hour() / 24).cos().alias("hour_cos"),
@@ -110,7 +124,6 @@ def train_model():
         (2 * np.pi * time.dt.ordinal_day() / 365).sin().alias("doy_sin"),
         (2 * np.pi * time.dt.ordinal_day() / 365).cos().alias("doy_cos"),
     ])
-
 
     # build lagged dataset
 
@@ -125,8 +138,6 @@ def train_model():
     Q_cpu = Q.to_numpy()
 
     X, Y, Y_idx = build_multi_horizon_dataset(Q_cpu, in_stations, out_stations, time_window, horizons)
-    X = np.log10(X)
-    Y = np.log10(Y)
 
     # initialize distributed environment
     visible_devices = [int(gpu) for gpu in os.environ['CUDA_VISIBLE_DEVICES'].split(',')]          
@@ -169,7 +180,7 @@ def train_model():
     Y_local = Y[start:end]
     
     train, val, test, times = create_train_val_test(X_local, Y_local, time)
-    num_epochs = 20
+    num_epochs = 10
 
     in_features = X.shape[-1]
     out_features = Y.shape[-2]
@@ -177,16 +188,16 @@ def train_model():
     quantiles = jnp.array([0.05, 0.5, 0.95])
     
     key = jax.random.PRNGKey(123)
+    keys = jax.random.split(key, num=jax.local_device_count()) 
     x = jnp.zeros((batch_size, time_window, in_features))
     
-    model = QATNRegressor(
-        features=out_features, 
-        quantiles=len(quantiles), 
-        hidden_size=hidden_size,
-        depth=2, 
-        n_heads=4,
-        causal=True, 
-        dropout=0.0 
+    model = QRoPETRegressor(
+        d_model = hidden_size, 
+        num_heads = 4, 
+        mlp_dim = 128, 
+        num_layers = 3, 
+        out_features = out_features, 
+        n_quantiles = len(quantiles)
     )
 
     params = model.init(key, x)
@@ -197,16 +208,16 @@ def train_model():
     warmup_steps = 500
 
     schedule = optax.warmup_cosine_decay_schedule(
-        init_value=5e-5,          # very small start
-        peak_value=2e-3,          # max LR (after warmup)
+        init_value=1e-6,          # very small start
+        peak_value=1e-4,          # max LR (after warmup)
         warmup_steps=warmup_steps,
         decay_steps=total_steps-warmup_steps,  # decay until end of training
-        end_value=5e-4            # LR at final step (lower = steeper decay)
+        end_value=5e-5            # LR at final step (lower = steeper decay)
     )
     
     tx = optax.adamw(learning_rate=schedule, weight_decay=1e-5)
     
-    state = QATNTrainState.create(apply_fn=model.apply, params=params,tx=tx)
+    state = ModelTrainState.create(apply_fn=model.apply, params=params,tx=tx)
     
     horizon_weights = jnp.array([1.0, 1.1, 1.2, 1.5, 1.7]) 
     horizon_weights /= jnp.mean(horizon_weights)
@@ -243,7 +254,7 @@ def train_model():
 
         for batch in train_prefetch:
             batch = shard_batch(batch)
-            state, loss = p_train_step(state, batch)
+            state, loss = p_train_step(state, batch, keys)
             train_loss.append(loss)
 
         # Validation phase
@@ -265,6 +276,13 @@ def train_model():
         if jax.process_index() == 0:
             logger.info(f"Epoch {epoch+1}")
             logger.info(f"Train Loss: {loss_train.item():.4f}, Val Loss: {loss_val.item():.4f}")
+
+    # Save model parameters for inference
+    ckpt = {"model": state}
+
+    orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+    save_args = orbax_utils.save_args_from_target(ckpt)
+    orbax_checkpointer.save(f'checkpoints/QRoPET/model_{date.today().strftime('%Y-%m-%d_%H:%M:%S')}', ckpt, save_args=save_args)
 
     # Testing phase
     test_gen = batch_iterator(test, batch_size=batch_size, shuffle=False)
@@ -304,24 +322,39 @@ def train_model():
     ax.set_yscale("log")
     ax.grid(alpha=0.25, which="both")
     fig.legend()
-    fig.savefig("QATN_Loss.png")
+    fig.savefig("QRoPET_Loss.png")
     plt.close()
 
     fig, ax = plt.subplots(figsize=(8,5))
     ax.hist(test_loss, label="Test Loss Histogram")
     fig.legend()
-    fig.savefig("QATN_Test_Loss.png")
+    fig.savefig("QRoPET_Test_Loss.png")
     plt.close()
 
     for i in range(medians.shape[1]):
         fig, ax = plt.subplots(figsize=(12,5))
-        ax.plot(10**truths[:,i], label="Ground Truth")
-        ax.plot(10**(medians[:,i]), label="Median", linestyle=2)
-        ax.fill_between(np.arange(lows[:,i].shape[0]), 10**(lows[:,i]), 10**(highs[:,i]), alpha=0.25, label="Quantiles = [0.05,0.95]")
+
+        # Ground truth
+        ax.plot(10**truths[:, i], label="Ground Truth", linewidth=2.5, color="black", zorder=3)
+
+        # Prediction median
+        ax.plot(10**medians[:, i], label="Prediction (Median)", linewidth=2, linestyle="--", color="tab:blue")
+
+        # Uncertainty band
+        ax.fill_between(
+            np.arange(lows[:, i].shape[0]),
+            10**lows[:, i], 10**highs[:, i],
+            alpha=0.25, color="tab:blue", label="90% Prediction Interval"
+        )
+
         ax.set_xlabel("Time point")
-        ax.set_ylabel("Flow Discharge [m^3/s]")
-        ax.grid(alpha=0.25)
+        ax.set_ylabel("Flow Discharge [m³/s]")
         ax.set_yscale("log")
-        fig.legend()
-        fig.savefig(f"QATNpredictions_{i}.png")
+        ax.grid(alpha=0.25)
+
+        fig.suptitle(f"QRoPET Forecast - Horizon {horizons[i]//4}h")
+        fig.legend(loc="upper right")
+        fig.tight_layout()
+
+        fig.savefig(f"QRoPETpredictions_{i}.png", dpi=300)
         plt.close()

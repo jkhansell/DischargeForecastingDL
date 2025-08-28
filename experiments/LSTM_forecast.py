@@ -3,15 +3,21 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import re
 import os
+import socket
 
 from utils.datautils import (
     get_data, build_multi_horizon_dataset, 
     get_discharges, create_train_val_test,
     batch_iterator, prefetch_batches, shard_batch, reshape_fn
 )
-from utils.trainingutils import quantile_loss_complex, cosine_annealing
 
-from models.LSTM import LSTMRegressor, LSTMTrainState, LSTMtrain_step, LSTMeval_step
+from utils.trainingutils import (
+    quantile_loss_complex, cosine_annealing, 
+    train_step, eval_step, 
+    ModelTrainState
+)
+
+from models.LSTM import LSTMRegressor
 
 # import DL libraries
 import jax
@@ -22,6 +28,19 @@ import flax.linen as nn
 from flax.jax_utils  import prefetch_to_device
 import optax
 
+
+# logging
+import logging, sys
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+
+logger = logging.getLogger()
+
+
 # Define a mapping from window suffix to temporal length (in increasing order)
 temporal_order = {
     "": 0,      # original column
@@ -29,7 +48,8 @@ temporal_order = {
     "6h" : 2,
     "12h": 3,
     "1D": 4,
-    "1W": 5,
+    "3D": 5, 
+    "1W": 6,
 }
 
 # 15-min resolution -> integer number of rows
@@ -38,6 +58,7 @@ windows = {
     "6h" : 24,
     "12h": 48,
     "1D": 96,
+    "3D": 96*3, 
     "1W": 672,
 #    "2W": 1344,
 #    "1M": 2880,
@@ -87,8 +108,10 @@ def train_model():
     in_stations = np.array([i for i in range(len(Q.columns))])
     out_stations = np.array([cols["08166200"]])
 
-    time_window = 64        # 16 hours of context 
-    horizons = (15*4*np.array([2, 4, 8, 16, 32]))  # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
+    time_window = 128        # 15*4*64 hours of context 
+    horizons = (4*np.array([2, 4, 8, 16, 32]))  # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
+
+    logger.info(f"Time Window: {time_window} | Horizons: {horizons}")
 
     Q_cpu = Q.to_numpy()
 
@@ -103,9 +126,9 @@ def train_model():
         local_device_ids=visible_devices
     )
 
-    print(f"[JAX] ProcID: {jax.process_index()}")
-    print(f"[JAX] Local devices: {jax.local_devices()}")
-    print(f"[JAX] Global devices: {jax.devices()}")
+    logger.info(f"[JAX] ProcID: {jax.process_index()}")
+    logger.info(f"[JAX] Local devices: {jax.local_devices()}")
+    logger.info(f"[JAX] Global devices: {jax.devices()}")
     
     num_devices = len(jax.local_devices())
     per_device_batch_size = 128  # batch size per device
@@ -126,7 +149,7 @@ def train_model():
     # Devices
     n_local_devices = jax.local_device_count()   # 4 GPUs per host
     n_total_devices = jax.device_count()         # 8 total
-    print(f"Host {jax.process_index()} sees {n_local_devices} local devices")
+    logger.info(f"Host {jax.process_index()} sees {n_local_devices} local devices")
 
     # Each host keeps only its slice
     host_index = jax.process_index()
@@ -137,9 +160,7 @@ def train_model():
     Y_local = Y[start:end]
     
     train, val, test, times = create_train_val_test(X_local, Y_local, time)
-   
-    print(X_local.shape)
-    num_epochs = 35
+    num_epochs = 20
 
     in_features = X.shape[-1]
     out_features = Y.shape[-2]
@@ -156,34 +177,38 @@ def train_model():
     # Training setup
     steps_per_epoch = len(train["x"]) // batch_size
     total_steps = num_epochs * steps_per_epoch
-    warmup_steps = 50
+    warmup_steps = 500
 
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=1e-6,          # very small start
-        peak_value=1e-4,          # max LR (after warmup)
+        peak_value=8e-5,          # max LR (after warmup)
         warmup_steps=warmup_steps,
         decay_steps=total_steps-warmup_steps,  # decay until end of training
-        end_value=1e-6            # LR at final step (lower = steeper decay)
+        end_value=1e-5            # LR at final step (lower = steeper decay)
     )
     
     tx = optax.adamw(learning_rate=schedule, weight_decay=1e-5)
 
     state = LSTMTrainState.create(apply_fn=model.apply, params=params,tx=tx)
 
+    horizon_weights = jnp.array([1.0, 1.1, 1.2, 1.5, 1.7]) 
+    horizon_weights /= jnp.mean(horizon_weights)
     loss_fn = lambda x,y: quantile_loss_complex(
-        x, y, quantiles, crossing_penalty_coef=0.2
+        x, y, quantiles, horizon_weights, crossing_penalty_coef=0.25
     )
 
-    train_step = LSTMtrain_step(loss_fn)
-    eval_step = LSTMeval_step(loss_fn)
+    Qtrain_step = train_step(loss_fn)
+    Qeval_step = eval_step(loss_fn)
 
     # training using data parallelism
-    p_LSTMtrain_step = jax.pmap(train_step, axis_name="batch")
-    p_LSTMeval_step = jax.pmap(eval_step, axis_name="batch")
+    p_train_step = jax.pmap(Qtrain_step, axis_name="batch")
+    p_eval_step = jax.pmap(Qeval_step, axis_name="batch")
     state = jax.device_put_replicated(state, jax.local_devices())
 
     train_losses = []
     val_losses = []
+
+    logger.info("Initializing Training Loop...")
 
     for epoch in range(num_epochs):
         
@@ -201,14 +226,15 @@ def train_model():
 
         for batch in train_prefetch:
             batch = shard_batch(batch)
-            state, loss = p_LSTMtrain_step(state, batch)
+            state, loss = p_train_step(state, batch)
             train_loss.append(loss)
 
         # Validation phase
         for batch in val_prefetch:
             batch = shard_batch(batch)
-            loss, _ = p_LSTMeval_step(state, batch)
+            loss, _ = p_eval_step(state, batch)
             val_loss.append(loss)
+
 
         # Compute epoch averages
 
@@ -217,10 +243,12 @@ def train_model():
 
         train_losses.append(loss_train)
         val_losses.append(loss_val)
+        
+        logger.info(f"Loss {jax.process_index()}: {train_loss[0]}, Name: {socket.gethostname()}")
 
         if jax.process_index() == 0:
-            print(f"Epoch {epoch+1}")
-            print(f"Train Loss: {loss_train.item():.4f}, Val Loss: {loss_val.item():.4f}")
+            logger.info(f"Epoch {epoch+1}")
+            logger.info(f"Train Loss: {loss_train.item():.4f}, Val Loss: {loss_val.item():.4f}")
 
     # Testing phase
     test_gen = batch_iterator(test, batch_size=batch_size, shuffle=False)
@@ -234,7 +262,7 @@ def train_model():
         
     for batch in test_prefetch:
         batch = shard_batch(batch)
-        loss, preds = p_LSTMeval_step(state, batch)
+        loss, preds = p_eval_step(state, batch)
         test_loss.append(np.mean(loss))
         
         # append for graphing
@@ -271,14 +299,16 @@ def train_model():
     # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
 
     for i in range(medians.shape[1]):
+
         fig, ax = plt.subplots(figsize=(12,5))
         ax.plot(10**truths[:,i],  label="Ground Truth")
-        ax.plot(10**medians[:,i], label="Median")
+        ax.plot(10**medians[:,i], label="Median", linewidth=2)
         ax.fill_between(np.arange(lows[:,i].shape[0]), 10**lows[:,i], 10**highs[:,i], alpha=0.25, label="Quantiles = [0.05,0.95]")
         ax.set_xlabel("Time point")
-        ax.set_ylabel("Flow Discharge [m^3/s]")
+        ax.set_ylabel("Flow Discharge [cfs]")
         ax.grid(alpha=0.25)
         ax.set_yscale("log")
+        fig.suptitle(f"LSTM Forecast - Horizon {horizons[i]//4}h")
         fig.legend()
         fig.savefig(f"LSTMpredictions_{i}.png")
         plt.close()

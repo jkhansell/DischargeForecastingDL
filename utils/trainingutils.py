@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+from flax.training import train_state
 
 @jax.jit
 def cosine_annealing(step, base_lr, min_lr, steps_per_cycle, m_mul=0.95, t_mul=1.0):
@@ -47,27 +48,83 @@ def quantile_loss_complex(
     y_pred,
     y_true,
     quantiles,
+    horizon_weights=None,       # shape (Nhorizons,)
     crossing_penalty_coef=0.0,
 ):
     """
-    Flexible quantile (pinball) loss using JAX-lax conditionals for JIT stability.
+    Flexible quantile (pinball) loss with optional horizon and station weighting.
     """
-
-    # Ensure y_true is (Nstations, 1)
-
-    # Error across all quantiles
-    error = y_true - y_pred  # (Nstations, Nquantiles)
+    # Ensure y_true shape matches y_pred
+    error = y_true - y_pred  # (Nstations, Nhorizons, Nquantiles)
 
     # Pinball loss
-    loss = jnp.maximum(quantiles * error, (quantiles - 1) * error)  # (Nstations, Nquantiles)
-    loss = jnp.mean(loss)
-    # Crossing penalty
+    pinball = jnp.maximum(quantiles * error, (quantiles - 1) * error)  # broadcast over quantiles
+
+    # Apply horizon weights if provided
+    if horizon_weights is not None:
+        pinball = pinball * horizon_weights[None, :, None]
+
+    loss = jnp.mean(pinball)
+
+    # Crossing penalty across quantiles
     def compute_penalty(_):
-        return jnp.mean(jnp.maximum(0, y_pred[:, :-1] - y_pred[:, 1:]))
-    crossing_penalty = jax.lax.cond(crossing_penalty_coef > 0.0, compute_penalty, lambda _: jnp.bfloat16(0.0), operand=None)
+        return jnp.mean(jnp.maximum(0, y_pred[:, :, :-1] - y_pred[:, :, 1:]))
+    crossing_penalty = jax.lax.cond(crossing_penalty_coef > 0.0, compute_penalty, lambda _: 0.0, operand=None)
 
     # Combine
     total_loss = loss + crossing_penalty_coef * crossing_penalty
 
-    # Return either per-quantile or total
     return total_loss
+
+def train_step(userloss):
+    @jax.jit
+    def func(state, batch, rng, *args, **kwargs):
+        rng, dropout_key = jax.random.split(rng)
+        
+        def loss_fn(params):
+            preds = state.apply_fn(params, batch['x'], train=True, rngs={'dropout': dropout_key})
+            loss = userloss(preds, batch['y'], *args, **kwargs)
+            return loss
+
+        # Loss + grads
+        loss, grads = jax.value_and_grad(loss_fn)(state.params)
+
+        # pmean across devices
+        grads = jax.tree_util.tree_map(lambda g: jax.lax.pmean(g, axis_name="batch"), grads)
+        loss = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, axis_name="batch"), loss)
+
+        # Update state
+        state = state.apply_gradients(grads=grads)
+        return state, loss
+
+    return func
+
+
+def eval_step(userloss):
+    @jax.jit
+    def func(state, batch, *args, **kwargs):
+        """
+        state: TrainState
+        batch: dict with "x" and "y"
+            x: (batch, time, input_features)
+            y: (batch, features)
+        """
+        # Forward pass without stochasticity
+        preds = state.apply_fn(state.params, batch['x'], train=False)
+
+        # Optionally cast to float32
+        preds = preds.astype(jnp.float32)
+
+        # Compute loss
+        loss = userloss(preds, batch['y'], *args, **kwargs)
+
+        # Average over devices
+        loss = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, axis_name="batch"), loss)
+
+        return loss, preds
+
+    return func
+
+class ModelTrainState(train_state.TrainState):
+    pass
+

@@ -1,0 +1,6 @@
+usage: mamba [-h] [-v] [--no-plugins] [-V] COMMAND ...
+mamba: error: unrecognized arguments: -N2
+usage: mamba [-h] [-v] [--no-plugins] [-V] COMMAND ...
+mamba: error: unrecognized arguments: -N2
+srun: error: jwb0971: task 1: Exited with exit code 2
+srun: error: jwb0970: task 0: Exited with exit code 2
