@@ -9,7 +9,8 @@ import socket
 from utils.datautils import (
     get_data, build_multi_horizon_dataset, 
     get_discharges, create_train_val_test,
-    batch_iterator, prefetch_batches, shard_batch, reshape_fn
+    batch_iterator, prefetch_batches, shard_batch, reshape_fn,
+    feature_engineering
 )
 
 from utils.trainingutils import (
@@ -39,10 +40,6 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger()
-
-# model parameter saving
-import orbax.checkpoint
-from flax.training import orbax_utils
 
 # Define a mapping from window suffix to temporal length (in increasing order)
 temporal_order = {
@@ -94,36 +91,8 @@ def train_model():
     time = time["datetime"].str.to_datetime("%Y-%m-%d %H:%M:%S%z")
 
     Q = Q.select(pl.col(pl.Float64))
-    
-    Q = Q.select([
-        pl.col(c).log10().alias(c)
-        for c in Q.columns 
-    ])
+    Q = feature_engineering(Q,time)
 
-
-    # Create a new DataFrame for all new features
-    ma_features = []
-    cols = {}
-    for i,col in enumerate(Q.columns):
-        for key, value in windows.items():
-            ma_features.append(
-                pl.col(col).rolling_median(window_size=value, min_samples=1).alias(f"{col}_MA_{key}")
-            )
-        cols[col] = i
-
-    # Add rolling means as new columns
-    Q = Q.with_columns(ma_features)
-    Q = Q.select(sorted(Q.columns, key=sort_key))
-
-    # Add temporal sinusoidal encoding to data 
-    Q = Q.with_columns([
-        (2 * np.pi * time.dt.hour() / 24).sin().alias("hour_sin"),
-        (2 * np.pi * time.dt.hour() / 24).cos().alias("hour_cos"),
-        (2 * np.pi * time.dt.weekday() / 7).sin().alias("dow_sin"),
-        (2 * np.pi * time.dt.weekday() / 7).cos().alias("dow_cos"),
-        (2 * np.pi * time.dt.ordinal_day() / 365).sin().alias("doy_sin"),
-        (2 * np.pi * time.dt.ordinal_day() / 365).cos().alias("doy_cos"),
-    ])
 
     # build lagged dataset
 
@@ -137,7 +106,9 @@ def train_model():
 
     Q_cpu = Q.to_numpy()
 
-    X, Y, Y_idx = build_multi_horizon_dataset(Q_cpu, in_stations, out_stations, time_window, horizons)
+    X, Y, Y_idx = build_multi_horizon_dataset(
+        Q_cpu, in_stations, out_stations, time_window, horizons
+    )
 
     # initialize distributed environment
     visible_devices = [int(gpu) for gpu in os.environ['CUDA_VISIBLE_DEVICES'].split(',')]          
@@ -156,7 +127,7 @@ def train_model():
 
     total_rows = X.shape[0]
     
- # number of full batches we can create
+    # number of full batches we can create
     num_full_batches = total_rows // batch_size
 
     # optionally trim X so it contains only full batches
@@ -277,13 +248,6 @@ def train_model():
             logger.info(f"Epoch {epoch+1}")
             logger.info(f"Train Loss: {loss_train.item():.4f}, Val Loss: {loss_val.item():.4f}")
 
-    # Save model parameters for inference
-    ckpt = {"model": state}
-
-    orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
-    save_args = orbax_utils.save_args_from_target(ckpt)
-    orbax_checkpointer.save(f'checkpoints/QRoPET/model_{date.today().strftime('%Y-%m-%d_%H:%M:%S')}', ckpt, save_args=save_args)
-
     # Testing phase
     test_gen = batch_iterator(test, batch_size=batch_size, shuffle=False)
     test_prefetch = prefetch_batches(test_gen, prefetch_size=32)
@@ -348,7 +312,7 @@ def train_model():
         )
 
         ax.set_xlabel("Time point")
-        ax.set_ylabel("Flow Discharge [m³/s]")
+        ax.set_ylabel("Flow Discharge [cfs]")
         ax.set_yscale("log")
         ax.grid(alpha=0.25)
 
@@ -358,3 +322,5 @@ def train_model():
 
         fig.savefig(f"QRoPETpredictions_{i}.png", dpi=300)
         plt.close()
+
+    jax.distributed.shutdown()

@@ -1,10 +1,16 @@
 import dataretrieval.nwis as nwis
+import re
+
 import numpy as np
 import pandas as pd
+import polars as pl
+
 import jax
 import jax.numpy as jnp
+
 import threading
 import queue
+
 
 # As some time series might be incomplete we use brownian bridges to interpolate in between the gaps
 
@@ -76,6 +82,67 @@ def get_data(path, sites, nan_sites):
 
     return Q
 
+# Define a mapping from window suffix to temporal length (in increasing order)
+temporal_order = {
+    "": 0,      # original column
+    "2h": 1,
+    "6h" : 2,
+    "12h": 3,
+    "1D": 4,
+    "3D": 5, 
+    "1W": 6,
+}
+
+# 15-min resolution -> integer number of rows
+windows = {
+    "2h": 8,
+    "6h" : 24,
+    "12h": 48,
+    "1D": 96,
+    "3D": 96*3, 
+    "1W": 672,
+}
+
+def sort_key(col):
+    # Match the station name and optional MA suffix
+    m = re.match(r"(\d+)(?:_MA_)?(.*)", col)
+    station, suffix = m.groups()
+    # Map suffix to temporal order
+    return (station, temporal_order.get(suffix, 99))
+
+def feature_engineering(Q, time):
+
+    Q = Q.select([
+        pl.col(c).log10().alias(c)
+        for c in Q.columns 
+    ])
+
+    # Create a new DataFrame for all new features
+    ma_features = []
+    cols = {}
+    for i,col in enumerate(Q.columns):
+        for key, value in windows.items():
+            ma_features.append(
+                pl.col(col).rolling_median(window_size=value, min_samples=1).alias(f"{col}_MA_{key}")
+            )
+        cols[col] = i
+
+    # Add rolling means as new columns
+    Q = Q.with_columns(ma_features)
+    Q = Q.select(sorted(Q.columns, key=sort_key))
+
+    # Add temporal sinusoidal encoding to data 
+    Q = Q.with_columns([
+        (2 * np.pi * time.dt.hour() / 24).sin().alias("hour_sin"),
+        (2 * np.pi * time.dt.hour() / 24).cos().alias("hour_cos"),
+        (2 * np.pi * time.dt.weekday() / 7).sin().alias("dow_sin"),
+        (2 * np.pi * time.dt.weekday() / 7).cos().alias("dow_cos"),
+        (2 * np.pi * time.dt.ordinal_day() / 365).sin().alias("doy_sin"),
+        (2 * np.pi * time.dt.ordinal_day() / 365).cos().alias("doy_cos"),
+    ])
+
+    return Q, cols
+
 
 def build_multi_horizon_dataset(Q, in_stations, out_stations, p, horizons):
     """
@@ -143,6 +210,25 @@ def create_train_val_test(X, Y, time, train_frac=0.7, val_frac=0.15):
 
     return train, val, test, (traintimes, valtimes, testtimes)
 
+def trim_to_batches(arr, per_device_batch_size):
+    """
+    Trim array so that it is divisible by the global batch size.
+    """
+    n = arr.shape[0]
+
+    n_local_devices = jax.local_device_count()
+    global_batch_size = per_device_batch_size * n_local_devices
+    n_batches = n // global_batch_size
+    valid_rows = n_batches * global_batch_size
+    arr = arr[:valid_rows]
+
+    n_hosts = jax.process_count()
+    host_id = jax.process_index()
+    per_host = valid_rows // n_hosts
+    start = host_id * per_host
+    end   = (host_id + 1) * per_host
+    return arr[start:end]
+    
 
 def batch_iterator(data, batch_size, n_devices=1, shuffle=True):
     """

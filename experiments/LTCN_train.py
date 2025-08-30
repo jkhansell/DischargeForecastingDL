@@ -1,14 +1,16 @@
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+from datetime import datetime
 import re
 import os
 import socket
+import matplotlib.pyplot as plt
 
 from utils.datautils import (
     get_data, build_multi_horizon_dataset, 
     get_discharges, create_train_val_test,
-    batch_iterator, prefetch_batches, shard_batch, reshape_fn
+    batch_iterator, prefetch_batches, shard_batch, reshape_fn,
+    feature_engineering, trim_to_batches
 )
 
 from utils.trainingutils import (
@@ -25,9 +27,9 @@ import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 from jax.experimental import multihost_utils
 import flax.linen as nn 
-from flax.jax_utils  import prefetch_to_device
-import optax
+from flax.jax_utils import unreplicate
 
+import optax
 
 # logging
 import logging, sys
@@ -40,40 +42,11 @@ logging.basicConfig(
 
 logger = logging.getLogger()
 
+# model parameter saving
+import orbax.checkpoint 
+from flax.training import orbax_utils
 
-# Define a mapping from window suffix to temporal length (in increasing order)
-temporal_order = {
-    "": 0,      # original column
-    "2h": 1,
-    "6h" : 2,
-    "12h": 3,
-    "1D": 4,
-    "3D": 5, 
-    "1W": 6,
-}
-
-# 15-min resolution -> integer number of rows
-windows = {
-    "2h": 8,
-    "6h" : 24,
-    "12h": 48,
-    "1D": 96,
-    "3D": 96*3, 
-    "1W": 672,
-#    "2W": 1344,
-#    "1M": 2880,
-#    "3M": 8640,
-#    "6M": 17280
-}
-
-def sort_key(col):
-    # Match the station name and optional MA suffix
-    m = re.match(r"(\d+)(?:_MA_)?(.*)", col)
-    station, suffix = m.groups()
-    # Map suffix to temporal order
-    return (station, temporal_order.get(suffix, 99))
-
-## We'll be studying the Guadalupe River in Kerr County, TX the USGS sites are the following
+# We'll be studying the Guadalupe River in Kerr County, TX the USGS sites are the following
 # Previously exploring the data some stations report the discharge variable in another column of the data frame
 
 sites = ["08165300", "08165500", "08166000", "08166140", "08166200"]
@@ -87,21 +60,11 @@ def train_model():
     Q = pl.from_pandas(Q)   
 
     time = Q.select("datetime")
+    time = time["datetime"].str.to_datetime("%Y-%m-%d %H:%M:%S%z")
+
     Q = Q.select(pl.col(pl.Float64))
-
-    # Create a new DataFrame for all new features
-    ma_features = []
-    cols = {}
-    for i,col in enumerate(Q.columns):
-        for key, value in windows.items():
-            ma_features.append(
-                pl.col(col).rolling_median(window_size=value, min_samples=1).alias(f"{col}_MA_{key}")
-            )
-        cols[col] = i
-
-    # Add rolling means as new columns
-    Q = Q.with_columns(ma_features)
-    Q = Q.select(sorted(Q.columns, key=sort_key))
+    
+    Q, cols = feature_engineering(Q,time)
 
     # build lagged dataset
 
@@ -116,8 +79,7 @@ def train_model():
     Q_cpu = Q.to_numpy()
 
     X, Y, Y_idx = build_multi_horizon_dataset(Q_cpu, in_stations, out_stations, time_window, horizons)
-    X = np.log10(X)
-    Y = np.log10(Y)
+    train, val, test, times = create_train_val_test(X, Y, time)
 
     # initialize distributed environment
     visible_devices = [int(gpu) for gpu in os.environ['CUDA_VISIBLE_DEVICES'].split(',')]          
@@ -130,37 +92,18 @@ def train_model():
     logger.info(f"[JAX] Local devices: {jax.local_devices()}")
     logger.info(f"[JAX] Global devices: {jax.devices()}")
     
-    num_devices = len(jax.local_devices())
-    per_device_batch_size = 128  # batch size per device
-    batch_size = per_device_batch_size * num_devices  # total batch across all devices
-
-    total_rows = X.shape[0]
-
-    # number of full batches we can create
-    num_full_batches = total_rows // batch_size
-
-    # optionally trim X so it contains only full batches
-    valid_rows = num_full_batches * batch_size
-    rows_per_device = valid_rows // jax.process_count()
-
-    X = X[:valid_rows]
-    Y = Y[:valid_rows]
-
     # Devices
     n_local_devices = jax.local_device_count()   # 4 GPUs per host
     n_total_devices = jax.device_count()         # 8 total
     logger.info(f"Host {jax.process_index()} sees {n_local_devices} local devices")
 
-    # Each host keeps only its slice
-    host_index = jax.process_index()
-    start = host_index * rows_per_device
-    end   = (host_index + 1) * rows_per_device
-    
-    X_local = X[start:end]
-    Y_local = Y[start:end]
-    
-    train, val, test, times = create_train_val_test(X_local, Y_local, time)
-    num_epochs = 20
+    per_device_batch_size = 64
+    batch_size = per_device_batch_size * jax.local_device_count()
+    for split in [train, val, test]:
+        split["x"] = trim_to_batches(split["x"], per_device_batch_size)
+        split["y"] = trim_to_batches(split["y"], per_device_batch_size)
+
+    num_epochs = 10
 
     in_features = X.shape[-1]
     out_features = Y.shape[-2]
@@ -195,7 +138,7 @@ def train_model():
     
     tx = optax.adamw(learning_rate=schedule, weight_decay=1e-5)
     
-    state = LTCNTrainState.create(apply_fn=model.apply, params=params,tx=tx)
+    state = ModelTrainState.create(apply_fn=model.apply, params=params,tx=tx)
 
     horizon_weights = jnp.array([1.0, 1.1, 1.2, 1.5, 1.7]) 
     horizon_weights /= jnp.mean(horizon_weights)
@@ -214,7 +157,7 @@ def train_model():
     train_losses = []
     val_losses = []
 
-    for epoch in range(num_epochs):
+    """for epoch in range(0):
         
         # Regular batch iterator
         train_gen = batch_iterator(train, batch_size=batch_size, shuffle=True)
@@ -251,7 +194,7 @@ def train_model():
 
         if jax.process_index() == 0:
             logger.info(f"Epoch {epoch+1}")
-            logger.info(f"Train Loss: {loss_train.item():.4f}, Val Loss: {loss_val.item():.4f}")
+            logger.info(f"Train Loss: {loss_train.item():.4f}, Val Loss: {loss_val.item():.4f}")"""
 
     # Testing phase
     test_gen = batch_iterator(test, batch_size=batch_size, shuffle=False)
@@ -278,39 +221,82 @@ def train_model():
     lows = np.concatenate(lows, axis=0)
     highs = np.concatenate(highs, axis=0)
     truths = np.concatenate(truths, axis=0)
+    test_loss = np.array(test_loss)
 
-    test_loss = np.array(test_loss).flatten()
+    truths_all = multihost_utils.process_allgather(truths)
+    medians_all = multihost_utils.process_allgather(medians)
+    lows_all = multihost_utils.process_allgather(lows)
+    highs_all = multihost_utils.process_allgather(highs)
+    test_loss_all = multihost_utils.process_allgather(test_loss)
 
     # plot losses
 
-    fig, ax = plt.subplots(figsize=(8,5))
-    ax.plot(train_losses, label="Train Loss")
-    ax.plot(val_losses, label="Validation Loss")
-    ax.set_xlabel("Epochs")
-    ax.set_ylabel("Loss")
-    ax.grid(alpha=0.25, which="both")
-    fig.legend()
-    fig.savefig("LTCN_Loss.png")
-    plt.close()
+    if jax.process_index() == 0:
 
-    fig, ax = plt.subplots(figsize=(8,5))
-    ax.hist(test_loss, label="Test Loss Histogram")
-    fig.legend()
-    fig.savefig("LTCN_Test_Loss.png")
-    plt.close()
-
-    # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
-
-    for i in range(medians.shape[1]):
-        fig, ax = plt.subplots(figsize=(12,5))
-        ax.plot(10**truths[:,i], label="Ground Truth")
-        ax.plot(10**medians[:,i], label="Median", linewidth=2)
-        ax.fill_between(np.arange(lows[:,i].shape[0]), 10**lows[:,i], 10**highs[:,i], alpha=0.25, label="Quantiles = [0.05,0.95]")
-        ax.set_xlabel("Time point")
-        ax.set_ylabel("Flow Discharge [cfs]")
-        ax.grid(alpha=0.25)
+        fig, ax = plt.subplots(figsize=(8,5))
+        ax.plot(train_losses, label="Train Loss")
+        ax.plot(val_losses, label="Validation Loss")
+        ax.set_xlabel("Epochs")
         ax.set_yscale("log")
-        fig.suptitle(f"LTCN Forecast - Horizon {horizons[i]//4}h")
+        ax.set_ylabel("Loss")
+        ax.grid(alpha=0.25, which="both")
         fig.legend()
-        fig.savefig(f"LTCNpredictions_{i}.png")
+        fig.savefig("LTCN_Loss.png")
         plt.close()
+
+        fig, ax = plt.subplots(figsize=(8,5))
+        ax.hist(test_loss, label="Test Loss Histogram")
+        fig.legend()
+        fig.savefig("LTCN_Test_Loss.png")
+        plt.close()
+
+        # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
+
+        for i in range(medians.shape[1]):
+            fig, ax = plt.subplots(figsize=(14,5))
+
+            # Ground truth
+            ax.plot(10**truths[:, i], label="Ground Truth", linewidth=2.5, color="black")
+
+            # Prediction median
+            ax.plot(10**medians[:, i], label="Prediction (Median)", linewidth=2, linestyle="--", color="tab:blue")
+
+            # Uncertainty band
+            ax.fill_between(
+                np.arange(lows[:, i].shape[0]),
+                10**lows[:, i], 10**highs[:, i],
+                alpha=0.25, color="tab:blue", label="90% Prediction Interval"
+            )
+
+            ax.set_xlabel("Time point")
+            ax.set_ylabel("Flow Discharge [cfs]")
+            ax.set_yscale("log")
+            ax.grid(alpha=0.25)
+
+            fig.suptitle(f"LTCN Forecast - Horizon {horizons[i]//4}h")
+            fig.legend(loc="upper right")
+            fig.tight_layout()
+
+            fig.savefig(f"LTCNpredictions_{i}.png", dpi=300)
+            plt.close()
+
+
+    
+
+
+    options = orbax.checkpoint.CheckpointManagerOptions(max_to_keep=2, create=True)
+    async_checkpointer = orbax.checkpoint.AsyncCheckpointer(
+        orbax.checkpoint.PyTreeCheckpointHandler(), timeout_secs=50
+    )
+    save_args = orbax_utils.save_args_from_target(ckpt)
+
+
+    fmt = '%Y-%m-%d_%H:%M:%S'
+    ckpt_path = f"./checkpoints/LTCN/model_{datetime.today().strftime(fmt)}"
+    os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+
+    orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+    save_args = orbax_utils.save_args_from_target(ckpt)
+    orbax_checkpointer.save(ckpt_path, ckpt, save_args=save_args)
+
+    jax.distributed.shutdown()

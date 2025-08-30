@@ -1,0 +1,17 @@
+INFO:2025-08-29 16:22:44,887:jax._src.distributed:109: JAX distributed initialized with visible devices: 0,1,2,3
+INFO:2025-08-29 16:22:44,887:jax._src.distributed:132: Starting JAX distributed service on [::]:63647
+INFO:2025-08-29 16:22:44,913:jax._src.distributed:149: Connecting to JAX distributed service on jwb0257:63647
+2025-08-29 16:27:49.914186: F external/xla/xla/pjrt/distributed/client.h:88] Terminating process because the JAX distributed service detected fatal errors. This most likely indicates that another task died; see the other task logs for more details. Disable Python buffering, i.e. `python -u`, to be sure to see all the previous output. absl::Status: DEADLINE_EXCEEDED: Deadline Exceeded
+
+RPC: /tensorflow.CoordinationService/RegisterTask
+/tmp/tmpu369dz_e: line 3: 2294349 Aborted                 (core dumped) python experiments.py ltcn
+
+ERROR conda.cli.main_run:execute(125): `conda run python experiments.py ltcn` failed. (See above for error)
+2025-08-29 16:22:15,349 [INFO] Time Window: 128 | Horizons: [  8  16  32  64 128]
+2025-08-29 16:22:44,887 [INFO] JAX distributed initialized with visible devices: 0,1,2,3
+2025-08-29 16:22:44,887 [INFO] Starting JAX distributed service on [::]:63647
+2025-08-29 16:22:44,913 [INFO] Connecting to JAX distributed service on jwb0257:63647
+
+srun: error: jwb0921: task 1: Terminated
+srun: error: jwb0257: task 0: Exited with exit code 134
+srun: Force Terminated StepId=12216479.0

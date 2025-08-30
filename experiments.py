@@ -1,7 +1,6 @@
-from experiments.LSTM_forecast import train_model as LSTMTrain
-from experiments.LTCN_forecast import train_model as LTCNTrain
-from experiments.QATN_forecast import train_model as QATNTrain
-from experiments.QRoPET_forecast import train_model as QRoPETTrain
+from experiments.LSTM_train import train_model as LSTMTrain
+from experiments.LTCN_train import train_model as LTCNTrain
+from experiments.QRoPET_train import train_model as QRoPETTrain
 
 import sys
 import traceback
