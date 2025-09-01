@@ -110,8 +110,14 @@ def sort_key(col):
     # Map suffix to temporal order
     return (station, temporal_order.get(suffix, 99))
 
-def feature_engineering(Q, time):
+def feature_engineering(path, sites, nan_sites):
+    Q = get_data(path, sites, nan_sites)
+    Q = pl.from_pandas(Q)   
 
+    time = Q.select("datetime")
+    time = time["datetime"].str.to_datetime("%Y-%m-%d %H:%M:%S%z")
+
+    Q = Q.select(pl.col(pl.Float64))
     Q = Q.select([
         pl.col(c).log10().alias(c)
         for c in Q.columns 
@@ -141,8 +147,7 @@ def feature_engineering(Q, time):
         (2 * np.pi * time.dt.ordinal_day() / 365).cos().alias("doy_cos"),
     ])
 
-    return Q, cols
-
+    return Q.to_numpy(), cols, time
 
 def build_multi_horizon_dataset(Q, in_stations, out_stations, p, horizons):
     """
@@ -210,27 +215,22 @@ def create_train_val_test(X, Y, time, train_frac=0.7, val_frac=0.15):
 
     return train, val, test, (traintimes, valtimes, testtimes)
 
-def trim_to_batches(arr, per_device_batch_size):
+def trim_to_batches(arr, global_batch_size):
     """
     Trim array so that it is divisible by the global batch size.
     """
     n = arr.shape[0]
-
-    n_local_devices = jax.local_device_count()
-    global_batch_size = per_device_batch_size * n_local_devices
     n_batches = n // global_batch_size
     valid_rows = n_batches * global_batch_size
     arr = arr[:valid_rows]
 
-    n_hosts = jax.process_count()
-    host_id = jax.process_index()
-    per_host = valid_rows // n_hosts
-    start = host_id * per_host
-    end   = (host_id + 1) * per_host
-    return arr[start:end]
+    return arr
     
 
-def batch_iterator(data, batch_size, n_devices=1, shuffle=True):
+
+
+
+def batch_iterator(data, batch_size, shuffle=True):
     """
     Generator yielding minibatches from a dataset dict.
 

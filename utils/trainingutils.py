@@ -90,15 +90,15 @@ def train_step(userloss):
         loss, grads = jax.value_and_grad(loss_fn)(state.params)
 
         # pmean across devices
-        grads = jax.tree_util.tree_map(lambda g: jax.lax.pmean(g, axis_name="batch"), grads)
-        loss = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, axis_name="batch"), loss)
-
+        #grads = jax.tree_util.tree_map(lambda g: jax.lax.pmean(g, axis_name="batch"), grads)
+        #grads = jax.tree_util.tree_map(lambda g: jax.lax.psum(g, 'batch') / jax.device_count(), grads)
+        #loss = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, axis_name="batch"), loss)
+        #loss = jax.tree_util.tree_map(lambda g: jax.lax.psum(g, 'batch') / jax.device_count(), loss)
         # Update state
         state = state.apply_gradients(grads=grads)
         return state, loss
 
     return func
-
 
 def eval_step(userloss):
     @jax.jit
@@ -119,7 +119,7 @@ def eval_step(userloss):
         loss = userloss(preds, batch['y'], *args, **kwargs)
 
         # Average over devices
-        loss = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, axis_name="batch"), loss)
+        #loss = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, axis_name="batch"), loss)
 
         return loss, preds
 

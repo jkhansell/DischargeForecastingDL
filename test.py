@@ -1,6 +1,6 @@
-from experiments.LSTM_train import train_model as LSTMTrain
-from experiments.LTCN_train import train_model as LTCNTrain
-from experiments.QRoPET_train import train_model as QRoPETTrain
+from experiments.test.LSTM_test import test_model as LSTMTest
+from experiments.test.LTCN_test import test_model as LTCNTest
+from experiments.test.QRoPET_test import test_model as QRoPETTest
 
 import sys
 import traceback
@@ -11,13 +11,13 @@ if __name__ == "__main__":
         model = sys.argv[1]
 
         if model == "lstm":
-            LSTMTrain()
+            LSTMTest()
         elif model == "ltcn":
-            LTCNTrain()
+            LTCNTest()
         elif model == "qatn":
-            QATNTrain()
+            QATNTest()
         elif model == "qropet":
-            QRoPETTrain()
+            QRoPETTest()
         else:
             print("no model selected")
     
@@ -25,4 +25,3 @@ if __name__ == "__main__":
         import jax 
         if jax.process_index() == 0:
             traceback.print_exc()
-
