@@ -14,8 +14,6 @@ if __name__ == "__main__":
             LSTMTrain()
         elif model == "ltcn":
             LTCNTrain()
-        elif model == "qatn":
-            QATNTrain()
         elif model == "qropet":
             QRoPETTrain()
         else:

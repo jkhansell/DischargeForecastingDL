@@ -1,4 +1,0 @@
-/tmp/tmpe5h3_i1u: line 3: OL: command not found
-
-ERROR conda.cli.main_run:execute(125): `conda run OL python experiments.py lstm` failed. (See above for error)
-srun: error: jwb0252: task 0: Exited with exit code 127

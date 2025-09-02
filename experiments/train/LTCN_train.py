@@ -1,12 +1,32 @@
+# global imports
+
+# Data analysis libraries
 import numpy as np
 import polars as pl
 import pandas as pd
+import matplotlib.pyplot as plt
 from datetime import datetime
 import re
-import os
-import socket
-import matplotlib.pyplot as plt
 
+# System handling libraries
+import os
+import sys
+import socket
+
+# Deep Learning and accelerated computing libraries
+import jax
+import jax.numpy as jnp
+from jax.sharding import NamedSharding, PartitionSpec as P, Mesh
+from jax.experimental import multihost_utils
+
+# Optimization libraries
+import optax
+
+# Checkpointing libraries
+import orbax.checkpoint as ocp
+from flax.training import orbax_utils
+
+# Local utilities
 from utils.datautils import (
     get_data, build_multi_horizon_dataset, 
     get_discharges, create_train_val_test,
@@ -20,36 +40,8 @@ from utils.trainingutils import (
     ModelTrainState
 )
 
+# Model implementations
 from models.LTCN import LTCNRegressor 
-
-# import DL libraries
-import jax
-import jax.numpy as jnp
-from jax.sharding import NamedSharding, PartitionSpec as P, Mesh
-from jax.experimental import multihost_utils
-from jax.tree_util import tree_leaves
-
-import flax.linen as nn 
-from flax.jax_utils import unreplicate
-
-import optax
-
-# logging
-import logging, sys
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-
-logger = logging.getLogger()
-
-
-import orbax.checkpoint as ocp
-from orbax.checkpoint import Checkpointer, utils as ocp_utils
-from orbax.checkpoint import StandardCheckpointHandler
-from flax.training import orbax_utils
 
 # We'll be studying the Guadalupe River in Kerr County, TX the USGS sites are the following
 # Previously exploring the data some stations report the discharge variable in another column of the data frame
@@ -58,15 +50,15 @@ sites = ["08165300", "08165500", "08166000", "08166140", "08166200"]
 nan_sites = ["08166140", "08166200"]
 
 def train_model():
-    Q, cols, time = feature_engineering("./data/Q_clean.csv", sites, nan_sites)
+    Q, cols, time = feature_engineering("./data/Q_raw.csv", sites, nan_sites)
 
     in_stations = np.array([i for i in range(Q.shape[1])])
     out_stations = np.array([cols["08166200"]])
 
-    time_window = 32        # 15*4*64 hours of context 
+    time_window = 128        # 15*4*64 hours of context 
     horizons = (4*np.array([2, 4, 8, 16, 32]))  # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
 
-    logger.info(f"Time Window: {time_window} | Horizons: {horizons}")
+    print(f"Time Window: {time_window} | Horizons: {horizons}")
 
     X, Y, Y_idx = build_multi_horizon_dataset(Q, in_stations, out_stations, time_window, horizons)
     train, val, test, times = create_train_val_test(X, Y, time)
@@ -78,14 +70,14 @@ def train_model():
         local_device_ids=visible_devices
     )
 
-    logger.info(f"[JAX] ProcID: {jax.process_index()}")
-    logger.info(f"[JAX] Local devices: {jax.local_devices()}")
-    logger.info(f"[JAX] Global devices: {jax.devices()}")
+    print(f"[JAX] ProcID: {jax.process_index()}")
+    print(f"[JAX] Local devices: {jax.local_devices()}")
+    print(f"[JAX] Global devices: {jax.devices()}")
     
     # Devices
     n_local_devices = jax.local_device_count()   # 4 GPUs per host
     n_total_devices = jax.device_count()         # 8 total
-    logger.info(f"Host {jax.process_index()} sees {n_local_devices} local devices")
+    print(f"Host {jax.process_index()} sees {n_local_devices} local devices")
 
     per_device_batch_size = 64
     batch_size = per_device_batch_size * jax.device_count()
@@ -93,7 +85,7 @@ def train_model():
         split["x"] = trim_to_batches(split["x"], per_device_batch_size)
         split["y"] = trim_to_batches(split["y"], per_device_batch_size)
 
-    num_epochs = 10
+    num_epochs = 20
 
     in_features = train["x"].shape[-1]
     out_features = train["y"].shape[-2]
@@ -111,8 +103,6 @@ def train_model():
     )
 
     params = model.init(key, x)
-    logger.info(f"Model size {sum(x.size for x in tree_leaves(params))}.")
-    logger.info(f"Model memory {sum(x.size * x.dtype.itemsize for x in tree_leaves(params))/1024**2}.")
 
     # Training setup
     steps_per_epoch = len(train["x"]) // batch_size
@@ -130,7 +120,7 @@ def train_model():
     tx = optax.adamw(learning_rate=schedule, weight_decay=1e-5)
     state = ModelTrainState.create(apply_fn=model.apply, params=params,tx=tx)
 
-    horizon_weights = jnp.array([1.0, 1.1, 1.2, 1.5, 1.7]) 
+    horizon_weights = jnp.array([1.0, 1.0, 1.0, 1.0, 1.0]) 
     horizon_weights /= jnp.mean(horizon_weights)
     loss_fn = lambda x,y: quantile_loss_complex(
         x, y, quantiles, horizon_weights, crossing_penalty_coef=0.25
@@ -193,11 +183,11 @@ def train_model():
         train_losses.append(loss_train)
         val_losses.append(loss_val)
         
-        logger.info(f"Loss {jax.process_index()}: {train_loss[0]}, Name: {socket.gethostname()}")
+        print(f"Loss {jax.process_index()}: {train_loss[0]}, Name: {socket.gethostname()}")
 
         if jax.process_index() == 0:
-            logger.info(f"Epoch {epoch+1}")
-            logger.info(f"Train Loss: {loss_train.item():.4f}, Val Loss: {loss_val.item():.4f}")
+            print(f"Epoch {epoch+1}")
+            print(f"Train Loss: {loss_train.item():.4f}, Val Loss: {loss_val.item():.4f}")
 
 
     fig, ax = plt.subplots(figsize=(8,5))
@@ -208,9 +198,8 @@ def train_model():
     ax.grid(alpha=0.25, which="both")
     ax.set_yscale("log")
     fig.legend()
-    fig.savefig("LSTM_Loss.png")
+    fig.savefig("images/LTCN/LTCN_Loss.png")
     plt.close()
-
 
     async_checkpointer = ocp.AsyncCheckpointer(
         ocp.StandardCheckpointHandler(), timeout_secs=60
@@ -227,6 +216,5 @@ def train_model():
         custom_save_args = orbax_utils.save_args_from_target(ckpt)
         mngr.save(0, ckpt, save_kwargs={'save_args': custom_save_args})
         mngr.wait_until_finished()
-
 
     jax.distributed.shutdown()

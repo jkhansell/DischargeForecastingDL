@@ -22,9 +22,12 @@ def brownian_bridge(start, end, n_steps, step_std=1.0):
     bridge = start + (walk - t * walk[-1]) + t * (end - start)
     return bridge
 
-def fill_nans_with_random_walk(series, step_std=1.0):
+def fill_nans_with_random_walk(s, step_std=1.0, threshold=0.1):
     """Fill NaNs in df[col] with Brownian bridge random walks."""
-    n = len(series)
+    n = len(s)
+    series = s.copy()
+    series[series < threshold] = np.nan
+    series[series < 0] = np.nan
     i = 0
     while i < n:
         if pd.isna(series.iloc[i]):
@@ -41,23 +44,19 @@ def fill_nans_with_random_walk(series, step_std=1.0):
                 series.iloc[start_idx:end_idx + 1] = bridge
         else:
             i += 1
-    return series
+    return series.clip(lower=threshold)
 
 def get_discharges(sites, nan_sites, service="iv", start_date="2005-01-01", end_date="2025-08-15"):
 
     df = nwis.get_record(sites=sites, service=service, start=start_date, end=end_date)
     Q = pd.DataFrame()
-    std = 3.0
     if service == "iv":
         for site in sites:
             station_df = df.loc[site]
             if site in nan_sites:
                 data = station_df["00060"]
-                data = fill_nans_with_random_walk(data, std)
-
             else:
                 data = station_df["00060_15-minute update"]
-                data = fill_nans_with_random_walk(data, std)
 
             Q[site] = data
     else:
@@ -71,16 +70,21 @@ def get_discharges(sites, nan_sites, service="iv", start_date="2005-01-01", end_
 def get_data(path, sites, nan_sites):
     try: 
         Q = pd.read_csv(path)
-        #Q = Q.set_index("datetime")
     except:
         Q = get_discharges(sites, nan_sites, service="iv", start_date="2005-01-01", end_date="2025-01-31")        
-        Q = Q.interpolate(method="linear")
-        Q = Q.clip(lower=0.001)
-        Q = Q.bfill()
-        Q = Q.ffill() # Add this line to fill remaining NaNs
-        Q.to_csv(path)
+        Q.to_csv("./data/Q_raw.csv")
 
-    return Q
+    Q_filled = pd.DataFrame()
+    for col in Q.columns:
+        if col == "datetime":
+            Q_filled[col] = Q[col]
+        else:
+            data = Q[col].interpolate(method="linear")
+            data = fill_nans_with_random_walk(data, 0.5, 0.1)
+            Q_filled[col] = data
+    
+    Q_filled = Q_filled.dropna()
+    return Q, Q_filled
 
 # Define a mapping from window suffix to temporal length (in increasing order)
 temporal_order = {
@@ -111,7 +115,7 @@ def sort_key(col):
     return (station, temporal_order.get(suffix, 99))
 
 def feature_engineering(path, sites, nan_sites):
-    Q = get_data(path, sites, nan_sites)
+    Q_raw, Q = get_data(path, sites, nan_sites)
     Q = pl.from_pandas(Q)   
 
     time = Q.select("datetime")

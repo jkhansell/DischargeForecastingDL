@@ -6,7 +6,7 @@ import matplotlib.dates as mdates
 import re
 from datetime import datetime
 
-from utils.datautils import get_data, build_multi_horizon_dataset
+from utils.datautils import get_data, build_multi_horizon_dataset, fill_nans_with_random_walk
 
 
 # Define a mapping from window suffix to temporal length (in increasing order)
@@ -56,7 +56,26 @@ sites = ["08165300", "08165500", "08166000", "08166140", "08166200"]
 nan_sites = ["08166140", "08166200"]
 
 def EDA():
-    Q = get_data("./data/Q_clean.csv", sites, nan_sites)
+    Q_raw, Q_filled = get_data("./data/Q_raw.csv", sites, nan_sites)
+    for col in sites: 
+
+        fig, ax = plt.subplots(figsize=(14,5))
+        Q_raw[col].plot(ax=ax)
+        ax.set_yscale("log")
+        fig.savefig(f"RawQ{col}.png")
+        plt.close()
+            
+        fig, ax = plt.subplots(figsize=(14,5))
+        Q_filled[col].plot(ax=ax)
+        ax.set_yscale("log")
+        fig.savefig(f"InterpolatedQ{col}.png")
+        plt.close()
+
+    print(Q_filled[Q_filled.isnull().any(axis=1)])
+    Q_filled = Q_filled.dropna()
+    print(Q_filled)
+
+def OLDEDA(): 
     Q = pl.from_pandas(Q)
 
     # Feature engineering, augmenting dataset with
@@ -149,7 +168,7 @@ def EDA():
         cols[col] = i
 
 
-    # Add rolling means as new columns
+    # Add rolling means as new columns0
     Q = Q.with_columns(ma_features)
     Q = Q.select(sorted(Q.columns, key=sort_key))
 
@@ -195,68 +214,5 @@ def EDA():
         plt.savefig(f"images/rolling_sites_{win}.png")
         plt.close()
 
-import jax 
-import jax.numpy as jnp
-import os
-
-def build_sharded_dataset():
-    Q = get_data("./data/Q_clean.csv", sites, nan_sites)
-    Q = pl.from_pandas(Q)   
-
-    time = Q.select("datetime")
-    Q = Q.select(pl.col(pl.Float64))
-
-    # Create a new DataFrame for all new features
-    ma_features = []
-    cols = {}
-    for i,col in enumerate(Q.columns):
-        for key, value in windows.items():
-            ma_features.append(
-                pl.col(col).rolling_median(window_size=value, min_samples=1).alias(f"{col}_MA_{key}")
-            )
-        cols[col] = i
-
-    # Add rolling means as new columns
-    Q = Q.with_columns(ma_features)
-    Q = Q.select(sorted(Q.columns, key=sort_key))
-
-    # build lagged dataset
-
-    in_stations = np.array([i for i in range(len(Q.columns))])
-    out_stations = np.array([cols["08166200"]])
-
-    time_window = 64        # 16 hours of context 
-    horizons = (15*4*np.array([2, 4, 8, 16, 32]))  # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
-
-    Q_cpu = Q.to_numpy()
-
-    # compiling function for CPU
-    X, Y, Y_idx = build_multi_horizon_dataset(Q_cpu, in_stations, out_stations, time_window, horizons)
-
-
-    visible_devices = [int(gpu) for gpu in os.environ['CUDA_VISIBLE_DEVICES'].split(',')]          
-
-    jax.distributed.initialize(
-        local_device_ids=visible_devices
-    )
-
-    print(f"[JAX] ProcID: {jax.process_index()}")
-    print(f"[JAX] Local devices: {jax.local_devices()}")
-    print(f"[JAX] Global devices: {jax.devices()}")
-
-    # Create sharding specs
-    # Data is sharded across the batch dimension (first axis)
-    data_sharding = NamedSharding(mesh, P('data', None))
-    # Model parameters are replicated across all devices
-    params_sharding = NamedSharding(mesh, P(None))
-
-    batch_size = 128 * len(jax.devices())
-    total_rows = X.shape[0] 
-    valid_rows = (total_rows // batch_size) * batch_size
-
-
-
 if __name__ == "__main__":
-    #EDA()
-
-    build_sharded_dataset()
+    EDA()

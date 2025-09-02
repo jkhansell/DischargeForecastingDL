@@ -17,17 +17,17 @@ class LSTM(nn.Module):
         h0 = jnp.zeros((B, self.hidden_size), dtype=self.dtype)
         c0 = jnp.zeros((B, self.hidden_size), dtype=self.dtype)
 
-        # Wrap the OptimizedLSTMCell with scan across time
         lstm_scan = nn.scan(
             nn.OptimizedLSTMCell,
             variable_broadcast="params",
             split_rngs={"params": False},
-            in_axes=1,    # time axis in input
-            out_axes=1    # keep time axis in outputs
+            in_axes=1,
+            out_axes=1
         )(self.hidden_size, dtype=self.dtype, name="lstm_cell")
 
         (h_final, c_final), outputs = lstm_scan((h0, c0), x)
         return outputs
+
 
 class SeqRegressor(nn.Module):
     features: int
@@ -43,6 +43,7 @@ class SeqRegressor(nn.Module):
         out = nn.Dense(self.features * self.quantiles, dtype=self.dtype)(x)
         return out
 
+
 class LSTMRegressor(nn.Module):
     features: int
     quantiles: int
@@ -50,12 +51,12 @@ class LSTMRegressor(nn.Module):
     dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, *, train: bool = True):
         lstm = LSTM(hidden_size=self.hidden_size, dtype=self.dtype)
-        regressors = [SeqRegressor(1, self.quantiles) for _ in range(self.features)]
+        regressors = [SeqRegressor(1, self.quantiles, dtype=self.dtype) for _ in range(self.features)]
 
         x = lstm(x)
-        out = jnp.stack([regressor(x[:,-1,:]) for regressor in regressors],axis=1)
+        out = jnp.stack([regressor(x[:, -1, :]) for regressor in regressors], axis=1)
 
         return out.astype(jnp.float32)
 

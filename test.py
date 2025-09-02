@@ -14,8 +14,6 @@ if __name__ == "__main__":
             LSTMTest()
         elif model == "ltcn":
             LTCNTest()
-        elif model == "qatn":
-            QATNTest()
         elif model == "qropet":
             QRoPETTest()
         else:

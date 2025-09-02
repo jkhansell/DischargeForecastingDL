@@ -1,11 +1,32 @@
+# global imports
+
+# Data analysis libraries
 import numpy as np
+import polars as pl
 import pandas as pd
+import matplotlib.pyplot as plt
 from datetime import datetime
 import re
-import os
-import socket
-import matplotlib.pyplot as plt
 
+# System handling libraries
+import os
+import sys
+import socket
+
+# Deep Learning and accelerated computing libraries
+import jax
+import jax.numpy as jnp
+from jax.sharding import NamedSharding, PartitionSpec as P, Mesh
+from jax.experimental import multihost_utils
+
+# Optimization libraries
+import optax
+
+# Checkpointing libraries
+import orbax.checkpoint as ocp
+from flax.training import orbax_utils
+
+# Local utilities
 from utils.datautils import (
     get_data, build_multi_horizon_dataset, 
     get_discharges, create_train_val_test,
@@ -19,36 +40,9 @@ from utils.trainingutils import (
     ModelTrainState
 )
 
+# Model implementations
 from models.LTCN import LTCNRegressor 
 
-# import DL libraries
-import jax
-import jax.numpy as jnp
-from jax.sharding import NamedSharding, PartitionSpec as P, Mesh
-from jax.experimental import multihost_utils
-from jax.tree_util import tree_leaves
-
-import flax.linen as nn 
-from flax.jax_utils import unreplicate
-
-import optax
-
-# logging
-import logging, sys
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-
-logger = logging.getLogger()
-
-# A stateless object, can be created on the fly.
-from jax.sharding import NamedSharding, PartitionSpec as P, Mesh
-import orbax.checkpoint as ocp
-from orbax.checkpoint import utils as ocp_utils
-from flax.training import orbax_utils
 
 # We'll be studying the Guadalupe River in Kerr County, TX the USGS sites are the following
 # Previously exploring the data some stations report the discharge variable in another column of the data frame
@@ -56,23 +50,19 @@ from flax.training import orbax_utils
 sites = ["08165300", "08165500", "08166000", "08166140", "08166200"]
 nan_sites = ["08166140", "08166200"]
 
-import polars as pl
-
 def test_model():
-    Q, cols, time = feature_engineering("./data/Q_clean.csv", sites, nan_sites)
+    Q, cols, time = feature_engineering("./data/Q_raw.csv", sites, nan_sites)
 
     in_stations = np.array([i for i in range(Q.shape[1])])
     out_stations = np.array([cols["08166200"]])
 
-    time_window = 32        # 15*4*64 hours of context 
+    time_window = 128        # 15*4*64 hours of context 
     horizons = (4*np.array([2, 4, 8, 16, 32]))  # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
 
-    logger.info(f"Time Window: {time_window} | Horizons: {horizons}")
+    print(f"Time Window: {time_window} | Horizons: {horizons}")
 
     X, Y, Y_idx = build_multi_horizon_dataset(Q, in_stations, out_stations, time_window, horizons)
     train, val, test, times = create_train_val_test(X, Y, time)
-
-    logger.info(Y.shape)
 
     # initialize distributed environment
     visible_devices = [int(gpu) for gpu in os.environ['CUDA_VISIBLE_DEVICES'].split(',')]          
@@ -81,14 +71,14 @@ def test_model():
         local_device_ids=visible_devices
     )
 
-    logger.info(f"[JAX] ProcID: {jax.process_index()}")
-    logger.info(f"[JAX] Local devices: {jax.local_devices()}")
-    logger.info(f"[JAX] Global devices: {jax.devices()}")
+    print(f"[JAX] ProcID: {jax.process_index()}")
+    print(f"[JAX] Local devices: {jax.local_devices()}")
+    print(f"[JAX] Global devices: {jax.devices()}")
     
     # Devices
     n_local_devices = jax.local_device_count()   # 4 GPUs per host
     n_total_devices = jax.device_count()         # 8 total
-    logger.info(f"Host {jax.process_index()} sees {n_local_devices} local devices")
+    print(f"Host {jax.process_index()} sees {n_local_devices} local devices")
 
     per_device_batch_size = 64
     batch_size = per_device_batch_size * jax.device_count()
@@ -114,8 +104,6 @@ def test_model():
     )
 
     params = model.init(key, x)
-    logger.info(f"Model size {sum(x.size for x in tree_leaves(params))}.")
-    logger.info(f"Model memory {sum(x.size * x.dtype.itemsize for x in tree_leaves(params))/1024**2}.")
 
     # Training setup
     steps_per_epoch = len(train["x"]) // batch_size
@@ -131,7 +119,6 @@ def test_model():
     )
     
     tx = optax.adamw(learning_rate=schedule, weight_decay=1e-5)
-    initstate = ModelTrainState.create(apply_fn=model.apply, params=params,tx=tx)
     
     async_checkpointer = ocp.AsyncCheckpointer(
         ocp.StandardCheckpointHandler(), timeout_secs=60
@@ -146,11 +133,10 @@ def test_model():
     fmt = '%Y_%m_%d'
     checkpoint_dir = os.path.abspath("./checkpoints")
     checkpoint_dir = os.path.join(checkpoint_dir, f"LTCN/model_{datetime.today().strftime(fmt)}")
-    #checkpoint_dir="/work/jovillalobos/hidrologia/DischargeForecastingDL/experiments/checkpoints/LTCN/model_2025_08_30"
 
     options = ocp.CheckpointManagerOptions(max_to_keep=2)
 
-    abstract_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, initstate.params)
+    abstract_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, params)
 
     def set_sharding(x: jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
         return x.update(sharding=param_sharding)
@@ -163,11 +149,14 @@ def test_model():
 
     state = ModelTrainState.create(apply_fn=model.apply, params=params,tx=tx)
 
-    horizon_weights = jnp.array([1.0, 1.1, 1.2, 1.5, 1.7]) 
+    #horizon_weights = jnp.array([1.0, 1.1, 1.2, 1.5, 1.7]) 
+    horizon_weights = jnp.array([1.0, 1.0, 1.0, 1.0, 1.0]) 
     horizon_weights /= jnp.mean(horizon_weights)
     loss_fn = lambda x,y: quantile_loss_complex(
         x, y, quantiles, horizon_weights, crossing_penalty_coef=0.25
     )
+
+    print(jax.devices())
 
     # Mesh
     mesh = Mesh(jax.devices(), ('batch',))
@@ -227,13 +216,12 @@ def test_model():
     fig, ax = plt.subplots(figsize=(8,5))
     ax.hist(test_loss, bins=15, label="Test Loss Histogram")
     fig.legend()
-    fig.savefig("LTCN_Test_Loss.png")
+    fig.savefig("images/LTCN/LTCN_Test_Loss.png")
     plt.close()
 
     num_horizons = medians.shape[1]
 
     num_horizons = medians.shape[1]
-    scfig, scaxes = plt.subplots(1, num_horizons, figsize=(5*num_horizons, 5), squeeze=False)
 
     for i in range(num_horizons):
         y_med = medians[:, i]
@@ -259,31 +247,25 @@ def test_model():
         print(f"  Uncertainty Metrics -> PICP: {picp*100:.2f}%, MPIW: {mpiw:.3f}")
         print("-"*60)
 
-        ax = scaxes[0, i]
+        fig, ax = plt.subplots(figsize=(8,6))
+
         y_true = truths[:, i]
         y_med = medians[:, i]
         
-        err = np.abs(y_true - y_med)
-        nquant = np.quantile(err, 0.99)
-
-        y_true = y_true[err < nquant]
-        y_med = y_med[err < nquant]
-
         ax.scatter(y_true, y_med, alpha=0.4, color='tab:blue')
     
         # Ideal diagonal
         min_val = min(y_true.min(), y_med.min())
         max_val = max(y_true.max(), y_med.max())
         ax.plot([min_val, max_val], [min_val, max_val], 'k--')
-        ax.set_title("Horizon")
-
-        #ax.hist(err, bins=15)
+        ax.set_xlabel("True Discharge [cfs]")
+        ax.set_ylabel("Forecasted Discharge [cfs]")
         ax.grid(alpha=0.3)
-    
-    scfig.suptitle('Scatter Plots for First 5 Forecast Horizons', fontsize=16)
-    scfig.tight_layout(rect=[0, 0, 1, 0.95])
-    scfig.savefig('scatter_first5_horizons.png', dpi=300)
-    plt.close()
+        ax.set_aspect('equal')
+
+        fig.savefig(f"images/LTCN/ScatterPlots_{i}.png")
+
+        plt.close()
 
     for i in range(num_horizons):
         y_med = medians[:, i]
@@ -315,7 +297,7 @@ def test_model():
         fig.legend(loc="upper right")
         fig.tight_layout()
 
-        fig.savefig(f"LTCNpredictions_{i}.png", dpi=300)
+        fig.savefig(f"images/LTCN/LTCNpredictions_{i}.png", dpi=300)
         plt.close()
 
 
