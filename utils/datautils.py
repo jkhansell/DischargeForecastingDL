@@ -12,6 +12,9 @@ import threading
 import queue
 
 
+# Constants
+CFS2M3S = 0.028316846592        # cfs to m^3/s
+
 # As some time series might be incomplete we use brownian bridges to interpolate in between the gaps
 
 def brownian_bridge(start, end, n_steps, step_std=1.0):
@@ -116,14 +119,14 @@ def sort_key(col):
 
 def feature_engineering(path, sites, nan_sites):
     Q_raw, Q = get_data(path, sites, nan_sites)
-    Q = pl.from_pandas(Q)   
+    Q = pl.from_pandas(Q)
 
     time = Q.select("datetime")
     time = time["datetime"].str.to_datetime("%Y-%m-%d %H:%M:%S%z")
 
     Q = Q.select(pl.col(pl.Float64))
     Q = Q.select([
-        pl.col(c).log10().alias(c)
+        pl.col(c).mul(CFS2M3S).log10().alias(c) #removed log10
         for c in Q.columns 
     ])
 

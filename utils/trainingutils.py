@@ -50,15 +50,23 @@ def quantile_loss_complex(
     quantiles,
     horizon_weights=None,       # shape (Nhorizons,)
     crossing_penalty_coef=0.0,
+    cov_weight=0.25,
+    k=15, 
+    mae_coef=0.5
 ):
     """
     Flexible quantile (pinball) loss with optional horizon and station weighting.
     """
     # Ensure y_true shape matches y_pred
     error = y_true - y_pred  # (Nstations, Nhorizons, Nquantiles)
+    abs_e = jnp.abs(error)
 
+    # Huberized error
+    delta = 1.0
+    huber_e = jnp.where(abs_e <= delta, 0.5 * error**2 / delta, abs_e - 0.5 * delta)
+    
     # Pinball loss
-    pinball = jnp.maximum(quantiles * error, (quantiles - 1) * error)  # broadcast over quantiles
+    pinball = jnp.maximum(quantiles * huber_e, (quantiles - 1.0) * huber_e)
 
     # Apply horizon weights if provided
     if horizon_weights is not None:
@@ -71,10 +79,24 @@ def quantile_loss_complex(
         return jnp.mean(jnp.maximum(0, y_pred[:, :, :-1] - y_pred[:, :, 1:]))
     crossing_penalty = jax.lax.cond(crossing_penalty_coef > 0.0, compute_penalty, lambda _: 0.0, operand=None)
 
-    # Combine
-    total_loss = loss + crossing_penalty_coef * crossing_penalty
+    # coverage loss
+    
+    # Differentiable indicator: (batch, n_horizons, n_quantiles)
+    indicator_low = jax.nn.sigmoid(k * (y_true - y_pred[:,:,0, None]))
+    indicator_high = jax.nn.sigmoid(k * (y_pred[:,:,-1, None] - y_true))
+    
+    indicator = indicator_high*indicator_low
+
+    # extremum coverage
+    cov = jnp.mean(indicator)
+
+    # median absolute error 
+    mae = jnp.mean(jnp.abs(y_true - y_pred[:, :, y_pred.shape[-1]//2, None]))
+
+    total_loss = loss + crossing_penalty_coef * crossing_penalty + cov_weight * (cov - (quantiles.max() - quantiles.min()))**2 + mae_coef*mae
 
     return total_loss
+
 
 def train_step(userloss):
     @jax.jit
@@ -94,6 +116,7 @@ def train_step(userloss):
         #grads = jax.tree_util.tree_map(lambda g: jax.lax.psum(g, 'batch') / jax.device_count(), grads)
         #loss = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, axis_name="batch"), loss)
         #loss = jax.tree_util.tree_map(lambda g: jax.lax.psum(g, 'batch') / jax.device_count(), loss)
+        
         # Update state
         state = state.apply_gradients(grads=grads)
         return state, loss
@@ -127,4 +150,59 @@ def eval_step(userloss):
 
 class ModelTrainState(train_state.TrainState):
     pass
+
+
+
+@jax.jit
+def NLL(mu, logvar, y_true):
+    """
+    mu, logvar: (batch, nhorizon)
+    y_true: (batch, nhorizon)
+    """
+    mu = mu[:,:,None]
+    var = jnp.exp(logvar)[:,:,None]
+    
+    nll = 0.5 * (jnp.log(2 * jnp.pi * var) + (y_true - mu)**2 / var)
+    return jnp.mean(nll)
+
+@jax.jit
+def ELBO_train_step(state, batch, rng, *args, **kwargs):
+    rng, dropout_key = jax.random.split(rng)
+    
+    def loss_fn(params):
+        (mu, logvar), state_out = state.apply_fn(
+            params, batch['x'], train=True,
+            rngs={'dropout': dropout_key, 'sample': rng},
+            mutable=['ELBO']
+        )
+
+        kl_list = jnp.array([k 
+           for head in state_out['ELBO'].values() 
+           for layer in head.values() 
+           for k in layer['kl']])
+
+        kl_total = jnp.sum(kl_list) / batch['x'].shape[0]
+        loss = NLL(mu, logvar, batch['y'], *args, **kwargs) + 0.25*kl_total
+        return loss
+
+    loss, grads = jax.value_and_grad(loss_fn)(state.params)
+    state = state.apply_gradients(grads=grads)
+    return state, loss
+
+@jax.jit
+def ELBO_eval_step(state, batch, rng, *args, **kwargs):
+    rng, dropout_key = jax.random.split(rng)
+    
+    (mu, logvar), state_out = state.apply_fn(
+        state.params, batch['x'], train=False,
+        rngs={'sample': rng}, mutable=['ELBO']
+    )
+    kl_list = jnp.array([k 
+        for head in state_out['ELBO'].values() 
+        for layer in head.values() 
+        for k in layer['kl']])
+
+    kl_total = jnp.sum(kl_list) / batch['x'].shape[0]
+    loss = NLL(mu, logvar, batch['y'], *args, **kwargs) + kl_total
+    return loss, mu, logvar
 

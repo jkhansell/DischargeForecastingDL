@@ -36,7 +36,7 @@ from utils.datautils import (
 
 from utils.trainingutils import (
     quantile_loss_complex, cosine_annealing, 
-    train_step, eval_step, 
+    train_step, ELBO_eval_step, 
     ModelTrainState
 )
 
@@ -102,7 +102,7 @@ def test_model():
         mlp_dim = 128, 
         num_layers = 4, 
         out_features = out_features, 
-        n_quantiles = len(quantiles)
+        n_quantiles = 0
     )
 
     params = model.init(key, x)
@@ -135,7 +135,7 @@ def test_model():
     fmt = '%Y_%m_%d'
     checkpoint_dir = os.path.abspath("./checkpoints")
     checkpoint_dir = os.path.join(checkpoint_dir, f"QRoPET/model_{datetime.today().strftime(fmt)}")
-    #checkpoint_dir="/work/jovillalobos/hidrologia/DischargeForecastingDL/experiments/checkpoints/LTCN/model_2025_08_30"
+    checkpoint_dir="/p/project/ehrtas/villalobos1/RiverSimCR/rainfall_analysis/DischargeForecastingDL/checkpoints/QRoPET/model_2025_09_05"
 
     options = ocp.CheckpointManagerOptions(max_to_keep=2)
 
@@ -153,10 +153,10 @@ def test_model():
     state = ModelTrainState.create(apply_fn=model.apply, params=params,tx=tx)
 
     #horizon_weights = jnp.array([1.0, 1.1, 1.2, 1.5, 1.7]) 
-    horizon_weights = jnp.array([1.0, 1.0, 1.0, 1.0, 1.0]) 
+    horizon_weights = jnp.array([1.0, 1.1, 1.1, 1.2, 1.2]) 
     horizon_weights /= jnp.mean(horizon_weights)
     loss_fn = lambda x,y: quantile_loss_complex(
-        x, y, quantiles, horizon_weights, crossing_penalty_coef=0.25
+        x, y, quantiles, horizon_weights, crossing_penalty_coef=0.1, cov_weight=0.05, k=15
     )
 
     print(jax.devices())
@@ -167,16 +167,16 @@ def test_model():
     # Partition specs
     param_spec = P()        # fully replicated
     in_spec = P('batch', None, None)                    # shard batch
-    out_spec = P('batch', None, None)   
+    out_spec = P('batch', None)   
 
     in_batch_sharding = NamedSharding(mesh, in_spec)
     out_batch_sharding = NamedSharding(mesh, out_spec)
     param_sharding = NamedSharding(mesh, param_spec)
 
     p_eval_step = jax.jit(
-        eval_step(loss_fn),
-        in_shardings=(param_sharding, in_batch_sharding),
-        out_shardings=(param_sharding, out_batch_sharding)         # loss, preds
+        ELBO_eval_step,
+        in_shardings=(param_sharding, in_batch_sharding, param_sharding),
+        out_shardings=(param_sharding, out_batch_sharding, out_batch_sharding)         # loss, preds
     )
 
     # Testing phase
@@ -184,36 +184,47 @@ def test_model():
     test_prefetch = prefetch_batches(test_gen, prefetch_size=32)
 
     test_loss = []
-    medians = []
-    lows = []
-    highs = []
+    #medians = []
+    #lows = []
+    #highs = []
     truths = []
-        
+    mus = []
+    logvars = []
+
     for batch in test_prefetch:
-        loss, preds = p_eval_step(state, batch)
+        loss, mu, logvar = p_eval_step(state, batch, key)
         test_loss.append(np.mean(loss))
         
         # append for graphing
 
         truths.append(np.asarray(batch["y"].reshape(-1, batch["y"].shape[-2])))
-        lows.append(np.asarray(preds[..., 0].reshape(-1, preds.shape[1])))
-        medians.append(np.asarray(preds[..., 1].reshape(-1, preds.shape[1])))
-        highs.append(np.asarray(preds[..., 2].reshape(-1, preds.shape[1])))
+        mus.append(np.asarray(mu).reshape(-1, mu.shape[1]))
+        logvars.append(np.asarray(logvar).reshape(-1, logvar.shape[1]))
+        
+        #lows.append(np.asarray(preds[..., 0].reshape(-1, preds.shape[1])))
+        #medians.append(np.asarray(preds[..., 1].reshape(-1, preds.shape[1])))
+        #highs.append(np.asarray(preds[..., 2].reshape(-1, preds.shape[1])))
 
     # Test data analysis
 
-    medians = np.concatenate(medians, axis=0)
-    lows = np.concatenate(lows, axis=0)
-    highs = np.concatenate(highs, axis=0)
+    #medians = np.concatenate(medians, axis=0)
+    #lows = np.concatenate(lows, axis=0)
+    #highs = np.concatenate(highs, axis=0)
+    mus = np.concatenate(mus, axis=0)
+    logvars = np.concatenate(logvars, axis=0)
+    
+    print(mu.shape)
+    print(logvars.shape)
+
     truths = np.concatenate(truths, axis=0)
     test_loss = np.array(test_loss)
 
-    medians = 10**medians
-    lows = 10**lows
-    highs = 10**highs
+    #medians = 10**medians
+    #lows = 10**lows
+    #highs = 10**highs
     truths = 10**truths
-
-    # 90% quantile filtering for plotting loss histogram 
+    mus = 10**mus
+    stds = 10**(jnp.sqrt(jnp.exp(logvars)))
 
     nquant = np.quantile(test_loss, 0.99)
     test_loss = test_loss[test_loss < nquant] 
@@ -224,15 +235,18 @@ def test_model():
     fig.savefig("images/QRoPET/QRoPET_Test_Loss.png")
     plt.close()
 
-    num_horizons = medians.shape[1]
+    num_horizons = mus.shape[1]
 
     for i in range(num_horizons):
-        y_med = medians[:, i]
-        y_low = lows[:, i]
-        y_high = highs[:, i]
+        #y_med = medians[:, i]
+        #y_low = lows[:, i]
+        #y_high = highs[:, i]
         y_true = truths[:, i]
-        
-        # ----- Median metrics -----
+        y_pred = mus[:,i]
+        std_pred = stds[:,i]
+
+
+        """# ----- Median metrics -----
         rmse = np.sqrt(np.mean((y_med - y_true)**2))
         mae = np.mean(np.abs(y_med - y_true))
         r2 = 1 - np.sum((y_true - y_med)**2) / np.sum((y_true - np.mean(y_true))**2)
@@ -242,24 +256,21 @@ def test_model():
         inside_interval = (y_true >= y_low) & (y_true <= y_high)
         picp = inside_interval.mean()
         mpiw = np.mean(y_high - y_low)
-        crps_proxy = np.mean(np.abs(y_true - y_med))  # simple CRPS proxy
+        crps_proxy = np.mean(np.abs(y_true - y_med))  # simple CRPS proxy"""
         
         # ----- Print nicely -----
-        print(f"Horizon {horizons[i]//4}h:")
-        print(f"  Median Metrics -> RMSE: {rmse:.3f}, MAE: {mae:.3f}, R²: {r2:.3f}, MBE: {mbe:.3f}")
-        print(f"  Uncertainty Metrics -> PICP: {picp*100:.2f}%, MPIW: {mpiw:.3f}")
-        print("-"*60)
+        #print(f"Horizon {horizons[i]//4}h:")
+        #print(f"  Median Metrics -> RMSE: {rmse:.3f}, MAE: {mae:.3f}, R²: {r2:.3f}, MBE: {mbe:.3f}")
+        #print(f"  Uncertainty Metrics -> PICP: {picp*100:.2f}%, MPIW: {mpiw:.3f}")
+        #print("-"*60)
 
         fig, ax = plt.subplots(figsize=(8,8))
-
-        y_true = truths[:, i]
-        y_med = medians[:, i]
         
-        ax.scatter(y_true, y_med, alpha=0.4, color='tab:blue')
+        ax.scatter(y_true, y_pred, alpha=0.4, color='tab:blue')
     
         # Ideal diagonal
-        min_val = min(y_true.min(), y_med.min())
-        max_val = max(y_true.max(), y_med.max())
+        min_val = min(y_true.min(), y_pred.min())
+        max_val = max(y_true.max(), y_pred.max())
         ax.plot([min_val, max_val], [min_val, max_val], 'k--')
         ax.set_xlabel("True Discharge [cfs]")
         ax.set_ylabel("Forecasted Discharge [cfs]")
@@ -271,10 +282,12 @@ def test_model():
         plt.close()
 
     for i in range(num_horizons):
-        y_med = medians[:, i]
-        y_low = lows[:, i]
-        y_high = highs[:, i]
+        #y_med = medians[:, i]
+        #y_low = lows[:, i]
+        #y_high = highs[:, i]
         y_true = truths[:, i]
+        y_pred = mus[:,i]
+        std_pred = stds[:,i]
 
         fig, ax = plt.subplots(figsize=(14,5))
 
@@ -282,17 +295,17 @@ def test_model():
         ax.plot(y_true, label="Ground Truth", linewidth=2.5, linestyle="--", color="black")
 
         # Prediction median
-        ax.plot(y_med, label="Prediction (Median)", linewidth=1, color="red")
+        ax.plot(y_pred, label="Prediction (Mean)", linewidth=1, color="red")
 
         # Uncertainty band
         ax.fill_between(
-            np.arange(y_low.shape[0]),
-            y_low, y_high,
-            alpha=0.25, color="red", label="90% Prediction Interval"
+            np.arange(y_pred.shape[0]),
+            y_pred-3*std_pred, y_pred+3*std_pred,
+            alpha=0.25, color="red", label=r"3$\sigma$ Prediction Interval"
         )
 
         ax.set_xlabel("Time point")
-        ax.set_ylabel("Flow Discharge [cfs]")
+        ax.set_ylabel("Flow Discharge [m^3/s]")
         ax.set_yscale("log")
         ax.grid(alpha=0.25)
 
