@@ -66,15 +66,25 @@ class LTCN(nn.Module):
         x_final, outputs = ltcn_scan(h0, x)
         return outputs
 
+# ------------------------------
+# Seq Regressor
+# ------------------------------
 class SeqRegressor(nn.Module):
-    features: int
     quantiles: int
-    dtype: jnp.dtype = jnp.bfloat16
+    hidden_size: int
 
     @nn.compact
-    def __call__(self, x, *, train: bool = True):
-        out = nn.Dense(self.features * self.quantiles, dtype=self.dtype)(x)
-        return out
+    def __call__(self, x):
+
+        x = nn.Sequential([
+            nn.Dense(self.hidden_size),
+            nn.relu,
+            nn.Dense(self.hidden_size),
+            nn.relu,
+        ])(x)
+    
+        out = nn.Dense(self.quantiles)(x)
+        return out.astype(jnp.float32)  # final output float32
 
 
 class LTCNRegressor(nn.Module):
@@ -87,7 +97,7 @@ class LTCNRegressor(nn.Module):
     @nn.compact
     def __call__(self, x, *, train: bool = True):
         ltcn = LTCN(hidden_size=self.hidden_size, dtype=self.dtype)
-        regressors = [SeqRegressor(1, self.quantiles, self.dtype) for _ in range(self.features)]
+        regressors = [SeqRegressor(quantiles=self.n_quantiles, hidden_size=self.d_model) for _ in range(self.out_features)]
 
         x = ltcn(x, self.dt, train=train)
 

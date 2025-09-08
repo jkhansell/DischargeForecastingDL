@@ -1,0 +1,20 @@
+Horizon 2h:
+  Median Metrics -> RMSE: 5.198, MAE: 0.498, R²: 0.793, MBE: -0.092
+  Uncertainty Metrics -> PICP: 84.05%, MPIW: 2.056
+------------------------------------------------------------
+Horizon 4h:
+  Median Metrics -> RMSE: 3.211, MAE: 0.435, R²: 0.921, MBE: 0.023
+  Uncertainty Metrics -> PICP: 85.49%, MPIW: 1.639
+------------------------------------------------------------
+Horizon 8h:
+  Median Metrics -> RMSE: 4.818, MAE: 0.482, R²: 0.822, MBE: -0.095
+  Uncertainty Metrics -> PICP: 79.51%, MPIW: 1.762
+------------------------------------------------------------
+Horizon 16h:
+  Median Metrics -> RMSE: 6.567, MAE: 0.795, R²: 0.669, MBE: -0.076
+  Uncertainty Metrics -> PICP: 84.90%, MPIW: 3.019
+------------------------------------------------------------
+Horizon 32h:
+  Median Metrics -> RMSE: 9.992, MAE: 1.643, R²: 0.235, MBE: -0.280
+  Uncertainty Metrics -> PICP: 82.91%, MPIW: 5.240
+------------------------------------------------------------

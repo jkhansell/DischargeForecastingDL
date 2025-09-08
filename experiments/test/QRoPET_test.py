@@ -36,7 +36,7 @@ from utils.datautils import (
 
 from utils.trainingutils import (
     quantile_loss_complex, cosine_annealing, 
-    train_step, ELBO_eval_step, 
+    train_step, eval_step, 
     ModelTrainState
 )
 
@@ -59,10 +59,10 @@ def test_model():
     time_window = 128        # 15*4*64 hours of context 
     horizons = (4*np.array([2, 4, 8, 16, 32]))  # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
 
-    print(f"Time Window: {time_window} | Horizons: {horizons}")
 
     X, Y, Y_idx = build_multi_horizon_dataset(Q, in_stations, out_stations, time_window, horizons)
     train, val, test, times = create_train_val_test(X, Y, time)
+    print(f"Time Window: {time_window} | Horizons: {horizons}")
 
     # initialize distributed environment
     visible_devices = [int(gpu) for gpu in os.environ['CUDA_VISIBLE_DEVICES'].split(',')]          
@@ -80,13 +80,13 @@ def test_model():
     n_total_devices = jax.device_count()         # 8 total
     print(f"Host {jax.process_index()} sees {n_local_devices} local devices")
 
-    per_device_batch_size = 64
+    per_device_batch_size = 128
     batch_size = per_device_batch_size * jax.device_count()
     for split in [train, val, test]:
         split["x"] = trim_to_batches(split["x"], per_device_batch_size)
         split["y"] = trim_to_batches(split["y"], per_device_batch_size)
 
-    num_epochs = 10
+    num_epochs = 20
 
     in_features = train["x"].shape[-1]
     out_features = train["y"].shape[-2]
@@ -102,25 +102,30 @@ def test_model():
         mlp_dim = 128, 
         num_layers = 4, 
         out_features = out_features, 
-        n_quantiles = 0
+        n_quantiles = len(quantiles)
     )
 
     params = model.init(key, x)
 
-    # Training setup
     steps_per_epoch = len(train["x"]) // batch_size
     total_steps = num_epochs * steps_per_epoch
     warmup_steps = 500
 
-    schedule = optax.warmup_cosine_decay_schedule(
-        init_value=1e-6,          # very small start
-        peak_value=1e-3,          # max LR (after warmup)
-        warmup_steps=warmup_steps,
-        decay_steps=total_steps-warmup_steps,  # decay until end of training
-        end_value=5e-5            # LR at final step (lower = steeper decay)
-    )
-    
-    tx = optax.adamw(learning_rate=schedule, weight_decay=1e-4)
+    fractions = [0.2, 0.3, 0.5]  # adjust as needed
+    decay_steps = [int(f * total_steps) for f in fractions]
+
+    cosine_kwargs = [
+        dict(init_value=1e-6, peak_value=1e-3, warmup_steps=500,
+            decay_steps=decay_steps[0], end_value=2.5e-4),
+        dict(init_value=1e-6, peak_value=5e-4, warmup_steps=200,
+            decay_steps=decay_steps[1], end_value=7.5e-5),
+        dict(init_value=1e-6, peak_value=1e-4, warmup_steps=0,
+            decay_steps=decay_steps[2], end_value=1e-5),
+    ]
+
+    schedule = optax.sgdr_schedule(cosine_kwargs)
+
+    tx = optax.adamw(learning_rate=schedule, weight_decay=1e-5)
     
     async_checkpointer = ocp.AsyncCheckpointer(
         ocp.StandardCheckpointHandler(), timeout_secs=60
@@ -135,7 +140,7 @@ def test_model():
     fmt = '%Y_%m_%d'
     checkpoint_dir = os.path.abspath("./checkpoints")
     checkpoint_dir = os.path.join(checkpoint_dir, f"QRoPET/model_{datetime.today().strftime(fmt)}")
-    checkpoint_dir="/p/project/ehrtas/villalobos1/RiverSimCR/rainfall_analysis/DischargeForecastingDL/checkpoints/QRoPET/model_2025_09_05"
+    #checkpoint_dir="/work/jovillalobos/hidrologia/DischargeForecastingDL/checkpoints/QRoPET/model_2025_09_05/"
 
     options = ocp.CheckpointManagerOptions(max_to_keep=2)
 
@@ -153,13 +158,14 @@ def test_model():
     state = ModelTrainState.create(apply_fn=model.apply, params=params,tx=tx)
 
     #horizon_weights = jnp.array([1.0, 1.1, 1.2, 1.5, 1.7]) 
-    horizon_weights = jnp.array([1.0, 1.1, 1.1, 1.2, 1.2]) 
+    #horizon_weights = jnp.array([1.0, 1.1, 1.1, 1.2, 1.2]) 
+    #horizon_weights = jnp.array([1.0, 1.1, 1.3, 1.5, 1.7]) 
+    horizon_weights = jnp.array([1.0, 1.0, 1.0, 1.0, 1.0]) 
     horizon_weights /= jnp.mean(horizon_weights)
     loss_fn = lambda x,y: quantile_loss_complex(
-        x, y, quantiles, horizon_weights, crossing_penalty_coef=0.1, cov_weight=0.05, k=15
+        x, y, quantiles, horizon_weights, crossing_penalty_coef=0.1, cov_weight=0.05, k=50
     )
 
-    print(jax.devices())
 
     # Mesh
     mesh = Mesh(jax.devices(), ('batch',))
@@ -174,9 +180,9 @@ def test_model():
     param_sharding = NamedSharding(mesh, param_spec)
 
     p_eval_step = jax.jit(
-        ELBO_eval_step,
-        in_shardings=(param_sharding, in_batch_sharding, param_sharding),
-        out_shardings=(param_sharding, out_batch_sharding, out_batch_sharding)         # loss, preds
+        eval_step(loss_fn),
+        in_shardings=(param_sharding, in_batch_sharding),
+        out_shardings=(param_sharding, out_batch_sharding)         # loss, preds
     )
 
     # Testing phase
@@ -184,50 +190,40 @@ def test_model():
     test_prefetch = prefetch_batches(test_gen, prefetch_size=32)
 
     test_loss = []
-    #medians = []
-    #lows = []
-    #highs = []
+    medians = []
+    lows = []
+    highs = []
     truths = []
-    mus = []
-    logvars = []
 
     for batch in test_prefetch:
-        loss, mu, logvar = p_eval_step(state, batch, key)
+        loss, preds = p_eval_step(state, batch)
         test_loss.append(np.mean(loss))
         
         # append for graphing
 
         truths.append(np.asarray(batch["y"].reshape(-1, batch["y"].shape[-2])))
-        mus.append(np.asarray(mu).reshape(-1, mu.shape[1]))
-        logvars.append(np.asarray(logvar).reshape(-1, logvar.shape[1]))
         
-        #lows.append(np.asarray(preds[..., 0].reshape(-1, preds.shape[1])))
-        #medians.append(np.asarray(preds[..., 1].reshape(-1, preds.shape[1])))
-        #highs.append(np.asarray(preds[..., 2].reshape(-1, preds.shape[1])))
+        lows.append(np.asarray(preds[..., 0].reshape(-1, preds.shape[1])))
+        medians.append(np.asarray(preds[..., 1].reshape(-1, preds.shape[1])))
+        highs.append(np.asarray(preds[..., 2].reshape(-1, preds.shape[1])))
 
     # Test data analysis
 
-    #medians = np.concatenate(medians, axis=0)
-    #lows = np.concatenate(lows, axis=0)
-    #highs = np.concatenate(highs, axis=0)
-    mus = np.concatenate(mus, axis=0)
-    logvars = np.concatenate(logvars, axis=0)
-    
-    print(mu.shape)
-    print(logvars.shape)
+    medians = np.concatenate(medians, axis=0)
+    lows = np.concatenate(lows, axis=0)
+    highs = np.concatenate(highs, axis=0)
+
 
     truths = np.concatenate(truths, axis=0)
     test_loss = np.array(test_loss)
 
-    #medians = 10**medians
-    #lows = 10**lows
-    #highs = 10**highs
+    medians = 10**medians
+    lows = 10**lows
+    highs = 10**highs
     truths = 10**truths
-    mus = 10**mus
-    stds = 10**(jnp.sqrt(jnp.exp(logvars)))
 
-    nquant = np.quantile(test_loss, 0.99)
-    test_loss = test_loss[test_loss < nquant] 
+    #nquant = np.quantile(test_loss, 0.99)
+    #test_loss = test_loss[test_loss < nquant] 
 
     fig, ax = plt.subplots(figsize=(8,5))
     ax.hist(test_loss, bins=15, label="Test Loss Histogram")
@@ -235,18 +231,18 @@ def test_model():
     fig.savefig("images/QRoPET/QRoPET_Test_Loss.png")
     plt.close()
 
-    num_horizons = mus.shape[1]
+    num_horizons = medians.shape[1]
+
+    print("here")
 
     for i in range(num_horizons):
-        #y_med = medians[:, i]
-        #y_low = lows[:, i]
-        #y_high = highs[:, i]
+        y_med = medians[:, i]
+        y_low = lows[:, i]
+        y_high = highs[:, i]
         y_true = truths[:, i]
-        y_pred = mus[:,i]
-        std_pred = stds[:,i]
 
 
-        """# ----- Median metrics -----
+        # ----- Median metrics -----
         rmse = np.sqrt(np.mean((y_med - y_true)**2))
         mae = np.mean(np.abs(y_med - y_true))
         r2 = 1 - np.sum((y_true - y_med)**2) / np.sum((y_true - np.mean(y_true))**2)
@@ -256,21 +252,21 @@ def test_model():
         inside_interval = (y_true >= y_low) & (y_true <= y_high)
         picp = inside_interval.mean()
         mpiw = np.mean(y_high - y_low)
-        crps_proxy = np.mean(np.abs(y_true - y_med))  # simple CRPS proxy"""
+        crps_proxy = np.mean(np.abs(y_true - y_med))  # simple CRPS proxy
         
         # ----- Print nicely -----
-        #print(f"Horizon {horizons[i]//4}h:")
-        #print(f"  Median Metrics -> RMSE: {rmse:.3f}, MAE: {mae:.3f}, R²: {r2:.3f}, MBE: {mbe:.3f}")
-        #print(f"  Uncertainty Metrics -> PICP: {picp*100:.2f}%, MPIW: {mpiw:.3f}")
-        #print("-"*60)
+        print(f"Horizon {horizons[i]//4}h:")
+        print(f"  Median Metrics -> RMSE: {rmse:.3f}, MAE: {mae:.3f}, R²: {r2:.3f}, MBE: {mbe:.3f}")
+        print(f"  Uncertainty Metrics -> PICP: {picp*100:.2f}%, MPIW: {mpiw:.3f}")
+        print("-"*60)
 
         fig, ax = plt.subplots(figsize=(8,8))
         
-        ax.scatter(y_true, y_pred, alpha=0.4, color='tab:blue')
+        ax.scatter(y_true, y_med, alpha=0.4, color='tab:blue')
     
         # Ideal diagonal
-        min_val = min(y_true.min(), y_pred.min())
-        max_val = max(y_true.max(), y_pred.max())
+        min_val = min(y_true.min(), y_med.min())
+        max_val = max(y_true.max(), y_med.max())
         ax.plot([min_val, max_val], [min_val, max_val], 'k--')
         ax.set_xlabel("True Discharge [cfs]")
         ax.set_ylabel("Forecasted Discharge [cfs]")
@@ -281,27 +277,26 @@ def test_model():
         fig.savefig(f"images/QRoPET/ScatterPlots_{i}.png", dpi=250)
         plt.close()
 
-    for i in range(num_horizons):
-        #y_med = medians[:, i]
-        #y_low = lows[:, i]
-        #y_high = highs[:, i]
-        y_true = truths[:, i]
-        y_pred = mus[:,i]
-        std_pred = stds[:,i]
+    print("here")
 
+    for i in range(num_horizons):
+        y_med = medians[:, i]
+        y_low = lows[:, i]
+        y_high = highs[:, i]
+        y_true = truths[:, i]
         fig, ax = plt.subplots(figsize=(14,5))
 
         # Ground truth
-        ax.plot(y_true, label="Ground Truth", linewidth=2.5, linestyle="--", color="black")
+        ax.plot(y_true[80000:90000], label="Ground Truth", linewidth=2.5, linestyle="--", color="black")
 
         # Prediction median
-        ax.plot(y_pred, label="Prediction (Mean)", linewidth=1, color="red")
+        ax.plot(y_med[80000:90000], label="Prediction (Mean)", linewidth=1, color="red")
 
         # Uncertainty band
         ax.fill_between(
-            np.arange(y_pred.shape[0]),
-            y_pred-3*std_pred, y_pred+3*std_pred,
-            alpha=0.25, color="red", label=r"3$\sigma$ Prediction Interval"
+            np.arange(y_med[80000:90000].shape[0]),
+            y_low[80000:90000], y_high[80000:90000],
+            alpha=0.25, color="red", label="90% Prediction Interval"
         )
 
         ax.set_xlabel("Time point")

@@ -104,26 +104,31 @@ def train_model():
 
     params = model.init(key, x)
 
-    # Training setup
     steps_per_epoch = len(train["x"]) // batch_size
     total_steps = num_epochs * steps_per_epoch
     warmup_steps = 500
 
-    schedule = optax.warmup_cosine_decay_schedule(
-        init_value=1e-6,          # very small start
-        peak_value=8e-5,          # max LR (after warmup)
-        warmup_steps=warmup_steps,
-        decay_steps=total_steps-warmup_steps,  # decay until end of training
-        end_value=1e-5            # LR at final step (lower = steeper decay)
-    )
-    
+    fractions = [0.2, 0.3, 0.5]  # adjust as needed
+    decay_steps = [int(f * total_steps) for f in fractions]
+
+    cosine_kwargs = [
+        dict(init_value=1e-6, peak_value=1e-3, warmup_steps=500,
+            decay_steps=decay_steps[0], end_value=1e-4),
+        dict(init_value=1e-6, peak_value=5e-4, warmup_steps=200,
+            decay_steps=decay_steps[1], end_value=1e-5),
+        dict(init_value=1e-6, peak_value=5e-5, warmup_steps=0,
+            decay_steps=decay_steps[2], end_value=5e-6),
+    ]
+
+    schedule = optax.sgdr_schedule(cosine_kwargs)
     tx = optax.adamw(learning_rate=schedule, weight_decay=1e-5)
+
     state = ModelTrainState.create(apply_fn=model.apply, params=params,tx=tx)
 
-    horizon_weights = jnp.array([1.0, 1.0, 1.0, 1.0, 1.0]) 
+    horizon_weights = jnp.array([1.0, 1.1, 1.3, 1.5, 1.7]) 
     horizon_weights /= jnp.mean(horizon_weights)
     loss_fn = lambda x,y: quantile_loss_complex(
-        x, y, quantiles, horizon_weights, crossing_penalty_coef=0.25
+        x, y, quantiles, horizon_weights, crossing_penalty_coef=0.1, cov_weight=0.01, k=15
     )
 
     mesh = Mesh(jax.devices(), ('batch',))

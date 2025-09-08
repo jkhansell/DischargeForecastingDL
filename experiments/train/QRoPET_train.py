@@ -36,7 +36,7 @@ from utils.datautils import (
 
 from utils.trainingutils import (
     quantile_loss_complex, cosine_annealing, 
-    train_step, eval_step, ELBO_train_step, ELBO_eval_step,
+    train_step, eval_step,
     ModelTrainState
 )
 
@@ -58,8 +58,8 @@ def train_model():
     time_window = 128        # 15*4*64 hours of context 
     horizons = (4*np.array([2, 4, 8, 16, 32]))  # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
 
-    print(f"Time Window: {time_window} | Horizons: {horizons}")
 
+    print(f"Time Window: {time_window} | Horizons: {horizons}")
     X, Y, Y_idx = build_multi_horizon_dataset(Q, in_stations, out_stations, time_window, horizons)
     train, val, test, times = create_train_val_test(X, Y, time)
 
@@ -85,12 +85,12 @@ def train_model():
         split["x"] = trim_to_batches(split["x"], per_device_batch_size)
         split["y"] = trim_to_batches(split["y"], per_device_batch_size)
 
-    num_epochs = 20
+    num_epochs = 15
 
     in_features = train["x"].shape[-1]
     out_features = train["y"].shape[-2]
     hidden_size = 64
-    #quantiles = jnp.array([0.05, 0.5, 0.95])
+    quantiles = jnp.array([0.05, 0.5, 0.95])
     
     key = jax.random.PRNGKey(123)
     x = jnp.zeros((batch_size, time_window, in_features))
@@ -98,68 +98,77 @@ def train_model():
     model = QRoPETRegressor(
         d_model = hidden_size, 
         num_heads = 4, 
-        mlp_dim = 128, 
-        num_layers = 4, 
+        mlp_dim = 64, 
+        num_layers = 4,
         out_features = out_features, 
-        n_quantiles = 0 #len(quantiles)
+        n_quantiles = len(quantiles)
     )
 
     params = model.init(key, x)
     
-    """rng, dropout_key = jax.random.split(key)
-
-    y, state = model.apply(
-        params, x, mutable=["ELBO"], train=True, 
-        rngs={'dropout': dropout_key, 'sample': rng},
-    )
-
-    print(state["ELBO"])"""
-
-    # Training setup
     steps_per_epoch = len(train["x"]) // batch_size
     total_steps = num_epochs * steps_per_epoch
     warmup_steps = 500
 
-    schedule = optax.warmup_cosine_decay_schedule(
-        init_value=1e-6,          # very small start
-        peak_value=5e-4,          # max LR (after warmup)
-        warmup_steps=warmup_steps,
-        decay_steps=total_steps-warmup_steps,  # decay until end of training
-        end_value=1e-5            # LR at final step (lower = steeper decay)
-    )
-    
-    tx = optax.adamw(learning_rate=schedule, weight_decay=1e-5)
-    
+    fractions = [0.3, 0.5, 0.2]  # later fractions → slower decay
+    decay_steps = [int(f * total_steps) for f in fractions]
+
+    cosine_kwargs = [
+        dict(  # Phase 1: exploration
+            init_value=1e-6,
+            peak_value=1e-3,
+            warmup_steps=100,          # faster ramp than 500
+            decay_steps=decay_steps[0],
+            end_value=4e-4,            # higher floor → don’t stall
+        ),
+        dict(  # Phase 2: refinement
+            init_value=2e-5,
+            peak_value=8e-4,
+            warmup_steps=50,          # quick ramp
+            decay_steps=decay_steps[1],
+            end_value=2.5e-4,
+        ),
+        dict(  # Phase 3: consolidation
+            init_value=1e-5,
+            peak_value=4e-4,
+            warmup_steps=0,
+            decay_steps=decay_steps[2],
+            end_value=1e-5,
+        ),
+    ]
+    schedule = optax.sgdr_schedule(cosine_kwargs)
+
+    tx = optax.adamw(learning_rate=schedule, weight_decay=1e-4)
     state = ModelTrainState.create(apply_fn=model.apply, params=params,tx=tx)
     
-    #horizon_weights = jnp.array([1.0, 1.1, 1.1, 1.2, 1.2]) 
-    #horizon_weights /= jnp.mean(horizon_weights)
-    #loss_fn = lambda x,y: quantile_loss_complex(
-    #    x, y, quantiles, horizon_weights, crossing_penalty_coef=0.1, cov_weight=0.05, k=15
-    #)
-
+    horizon_weights = jnp.array([1.0, 1.0, 1.0, 1.0, 1.0]) 
+    horizon_weights /= jnp.mean(horizon_weights)
+    loss_fn = lambda x,y: quantile_loss_complex(
+        x, y, quantiles, horizon_weights, crossing_penalty_coef=0.1, cov_weight=0.05, k=50
+    )
+    
     mesh = Mesh(jax.devices(), ('batch',))
 
     # Partition specs
-    param_spec = P()        # fully replicated
+    param_spec = P()                                    # fully replicated
     in_spec = P('batch', None, None)                    # shard batch
-    #out_spec = P('batch', None, None)   
-    out_spec = P('batch', None)   
+    out_spec = P('batch', None, None)   
+    #out_spec = P('batch', None)
 
     in_batch_sharding = NamedSharding(mesh, in_spec)
     out_batch_sharding = NamedSharding(mesh, out_spec)
     param_sharding = NamedSharding(mesh, param_spec)
 
     p_train_step = jax.jit(
-        ELBO_train_step,
+        train_step(loss_fn),
         in_shardings=(param_sharding, in_batch_sharding, param_sharding),  # state, batch, rng
         out_shardings=(param_sharding, param_sharding)
     )
 
     p_eval_step = jax.jit(
-        ELBO_eval_step,
-        in_shardings=(param_sharding, in_batch_sharding, param_sharding),
-        out_shardings=(param_sharding, out_batch_sharding, out_batch_sharding)         # loss, preds
+        eval_step(loss_fn),
+        in_shardings=(param_sharding, in_batch_sharding),
+        out_shardings=(param_sharding, out_batch_sharding)         # loss, preds
     )
 
     train_losses = []
@@ -185,7 +194,7 @@ def train_model():
 
         # Validation phase
         for batch in val_prefetch:
-            loss, _, _ = p_eval_step(state, batch, key)
+            loss, _ = p_eval_step(state, batch)
             val_loss.append(loss)
 
         # Compute epoch averages
@@ -201,7 +210,6 @@ def train_model():
         if jax.process_index() == 0:
             print(f"Epoch {epoch+1}")
             print(f"Train Loss: {loss_train.item():.4f}, Val Loss: {loss_val.item():.4f}")
-
 
     fig, ax = plt.subplots(figsize=(8,5))
     ax.plot(train_losses, label="Train Loss")

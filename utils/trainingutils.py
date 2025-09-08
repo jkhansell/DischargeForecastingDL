@@ -97,7 +97,6 @@ def quantile_loss_complex(
 
     return total_loss
 
-
 def train_step(userloss):
     @jax.jit
     def func(state, batch, rng, *args, **kwargs):
@@ -151,8 +150,6 @@ def eval_step(userloss):
 class ModelTrainState(train_state.TrainState):
     pass
 
-
-
 @jax.jit
 def NLL(mu, logvar, y_true):
     """
@@ -166,9 +163,9 @@ def NLL(mu, logvar, y_true):
     return jnp.mean(nll)
 
 @jax.jit
-def ELBO_train_step(state, batch, rng, *args, **kwargs):
+def ELBO_train_step(state, batch, rng, step, total_steps, *args, **kwargs):
     rng, dropout_key = jax.random.split(rng)
-    
+
     def loss_fn(params):
         (mu, logvar), state_out = state.apply_fn(
             params, batch['x'], train=True,
@@ -182,7 +179,11 @@ def ELBO_train_step(state, batch, rng, *args, **kwargs):
            for k in layer['kl']])
 
         kl_total = jnp.sum(kl_list) / batch['x'].shape[0]
-        loss = NLL(mu, logvar, batch['y'], *args, **kwargs) + 0.25*kl_total
+        
+        beta = jnp.tanh(5 * step / total_steps)
+
+        nll = NLL(mu, logvar, batch['y'], *args, **kwargs)
+        loss = nll + beta * kl_total
         return loss
 
     loss, grads = jax.value_and_grad(loss_fn)(state.params)
@@ -190,7 +191,7 @@ def ELBO_train_step(state, batch, rng, *args, **kwargs):
     return state, loss
 
 @jax.jit
-def ELBO_eval_step(state, batch, rng, *args, **kwargs):
+def ELBO_eval_step(state, batch, rng, step, total_steps, *args, **kwargs):
     rng, dropout_key = jax.random.split(rng)
     
     (mu, logvar), state_out = state.apply_fn(
@@ -203,6 +204,8 @@ def ELBO_eval_step(state, batch, rng, *args, **kwargs):
         for k in layer['kl']])
 
     kl_total = jnp.sum(kl_list) / batch['x'].shape[0]
-    loss = NLL(mu, logvar, batch['y'], *args, **kwargs) + kl_total
+    beta = jnp.tanh(5 * step / total_steps)
+    nll = NLL(mu, logvar, batch['y'], *args, **kwargs)
+    loss = nll + beta * kl_total
     return loss, mu, logvar
 
