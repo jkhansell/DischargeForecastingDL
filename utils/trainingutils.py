@@ -42,7 +42,7 @@ def quantile_loss(y_pred, y_true, quantiles):
     error = y_true - y_pred                     # (Nstations, Nquantiles)
     loss = jnp.maximum(quantiles * error, (quantiles - 1) * error)
     return jnp.mean(loss)
-
+        
 @jax.jit
 def quantile_loss_complex(
     y_pred,
@@ -51,50 +51,50 @@ def quantile_loss_complex(
     horizon_weights=None,       # shape (Nhorizons,)
     crossing_penalty_coef=0.0,
     cov_weight=0.25,
-    k=15, 
-    mae_coef=0.5
+    k=100, 
+    mae_coef=1.0
 ):
-    """
-    Flexible quantile (pinball) loss with optional horizon and station weighting.
-    """
-    # Ensure y_true shape matches y_pred
-    error = y_true - y_pred  # (Nstations, Nhorizons, Nquantiles)
-    abs_e = jnp.abs(error)
+    error = y_true - y_pred
+    abs_e = jnp.abs(error) 
 
-    # Huberized error
-    delta = 1.0
-    huber_e = jnp.where(abs_e <= delta, 0.5 * error**2 / delta, abs_e - 0.5 * delta)
+    # Huberized error 
+    delta = 1.0 
+    huber_e = jnp.where(abs_e <= delta, 0.5 * error**2 / delta, abs_e - 0.5 * delta) 
     
-    # Pinball loss
-    pinball = jnp.maximum(quantiles * huber_e, (quantiles - 1.0) * huber_e)
+    # Pinball loss 
+    quantile_loss = jnp.maximum(quantiles * huber_e, (quantiles - 1.0) * huber_e)
 
-    # Apply horizon weights if provided
     if horizon_weights is not None:
-        pinball = pinball * horizon_weights[None, :, None]
+        quantile_loss = quantile_loss * horizon_weights[None, :, None]
 
-    loss = jnp.mean(pinball)
+    quantile_loss = jnp.mean(quantile_loss)
 
-    # Crossing penalty across quantiles
+    # Crossing penalty
     def compute_penalty(_):
         return jnp.mean(jnp.maximum(0, y_pred[:, :, :-1] - y_pred[:, :, 1:]))
-    crossing_penalty = jax.lax.cond(crossing_penalty_coef > 0.0, compute_penalty, lambda _: 0.0, operand=None)
 
-    # coverage loss
-    
-    # Differentiable indicator: (batch, n_horizons, n_quantiles)
+    crossing_penalty = jax.lax.cond(
+        crossing_penalty_coef > 0.0, compute_penalty, lambda _: 0.0, operand=None
+    )
+
+    # Coverage (using extreme quantiles only)
     indicator_low = jax.nn.sigmoid(k * (y_true - y_pred[:,:,0, None]))
     indicator_high = jax.nn.sigmoid(k * (y_pred[:,:,-1, None] - y_true))
-    
-    indicator = indicator_high*indicator_low
+    cov = jnp.mean(indicator_high * indicator_low)
 
-    # extremum coverage
-    cov = jnp.mean(indicator)
+    target_cov = quantiles.max() - quantiles.min()
+    cov_loss = (cov - target_cov)**2
 
-    # median absolute error 
-    mae = jnp.mean(jnp.abs(y_true - y_pred[:, :, y_pred.shape[-1]//2, None]))
+    # Median absolute error
+    median_idx = jnp.argmin(jnp.abs(quantiles - 0.5))
+    mae = jnp.mean(jnp.abs(y_true - y_pred[:, :, median_idx, None]))
 
-    total_loss = loss + crossing_penalty_coef * crossing_penalty + cov_weight * (cov - (quantiles.max() - quantiles.min()))**2 + mae_coef*mae
-
+    total_loss = (
+        quantile_loss
+        + crossing_penalty_coef * crossing_penalty
+        + cov_weight * cov_loss
+        + mae_coef * mae
+    )
     return total_loss
 
 def train_step(userloss):

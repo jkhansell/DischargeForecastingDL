@@ -55,8 +55,8 @@ def train_model():
     in_stations = np.array([i for i in range(Q.shape[1])])
     out_stations = np.array([cols["08166200"]])
 
-    time_window = 128        # 15*4*64 hours of context 
-    horizons = (4*np.array([2, 4, 8, 16, 32]))  # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
+    time_window = 256       # 4*64 hours of context 
+    horizons = (4*np.array([2, 4, 8, 12, 24]))  # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
 
 
     print(f"Time Window: {time_window} | Horizons: {horizons}")
@@ -98,7 +98,7 @@ def train_model():
     model = QRoPETRegressor(
         d_model = hidden_size, 
         num_heads = 4, 
-        mlp_dim = 64, 
+        mlp_dim = 128, 
         num_layers = 4,
         out_features = out_features, 
         n_quantiles = len(quantiles)
@@ -108,43 +108,28 @@ def train_model():
     
     steps_per_epoch = len(train["x"]) // batch_size
     total_steps = num_epochs * steps_per_epoch
-    warmup_steps = 500
-
-    fractions = [0.3, 0.5, 0.2]  # later fractions → slower decay
+    fractions = [0.2, 0.3, 0.5]  # adjust as needed
     decay_steps = [int(f * total_steps) for f in fractions]
 
     cosine_kwargs = [
-        dict(  # Phase 1: exploration
-            init_value=1e-6,
-            peak_value=1e-3,
-            warmup_steps=100,          # faster ramp than 500
-            decay_steps=decay_steps[0],
-            end_value=4e-4,            # higher floor → don’t stall
-        ),
-        dict(  # Phase 2: refinement
-            init_value=2e-5,
-            peak_value=8e-4,
-            warmup_steps=50,          # quick ramp
-            decay_steps=decay_steps[1],
-            end_value=2.5e-4,
-        ),
-        dict(  # Phase 3: consolidation
-            init_value=1e-5,
-            peak_value=4e-4,
-            warmup_steps=0,
-            decay_steps=decay_steps[2],
-            end_value=1e-5,
-        ),
+        dict(init_value=1e-6, peak_value=1e-3, warmup_steps=500,
+            decay_steps=decay_steps[0], end_value=5e-4),
+        dict(init_value=1e-6, peak_value=7.5e-4, warmup_steps=200,
+            decay_steps=decay_steps[1], end_value=5e-5),
+        dict(init_value=1e-6, peak_value=2.5e-4, warmup_steps=0,
+            decay_steps=decay_steps[2], end_value=1e-5),
     ]
+
     schedule = optax.sgdr_schedule(cosine_kwargs)
 
-    tx = optax.adamw(learning_rate=schedule, weight_decay=1e-4)
+    tx = optax.adamw(learning_rate=schedule, weight_decay=1e-5)
     state = ModelTrainState.create(apply_fn=model.apply, params=params,tx=tx)
     
     horizon_weights = jnp.array([1.0, 1.0, 1.0, 1.0, 1.0]) 
-    horizon_weights /= jnp.mean(horizon_weights)
+    horizon_weights /= jnp.max(horizon_weights)
     loss_fn = lambda x,y: quantile_loss_complex(
-        x, y, quantiles, horizon_weights, crossing_penalty_coef=0.1, cov_weight=0.05, k=50
+        x, y, quantiles, horizon_weights, 
+        crossing_penalty_coef=0.2, cov_weight=1.0, k=100, mae_coef=1.0
     )
     
     mesh = Mesh(jax.devices(), ('batch',))

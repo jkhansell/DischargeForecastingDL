@@ -1,6 +1,7 @@
 from experiments.test.LSTM_test import test_model as LSTMTest
 from experiments.test.LTCN_test import test_model as LTCNTest
 from experiments.test.QRoPET_test import test_model as QRoPETTest
+from experiments.test.QATN_test import test_model as QATNTest
 
 import sys
 import traceback
@@ -16,6 +17,8 @@ if __name__ == "__main__":
             LTCNTest()
         elif model == "qropet":
             QRoPETTest()
+        elif model == "qatn":
+            QATNTest()
         else:
             print("no model selected")
     

@@ -141,12 +141,12 @@ class QATNRegressor(nn.Module):
     hidden_size: int
     depth: int
     n_heads: int
-    causal: bool
-    dropout: float
+    causal: bool = False
+    dropout: float = 0.1
     compute_dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, train=True):
         x = x.astype(self.compute_dtype)
         qatn = QATNEncoder(
             hidden_size=self.hidden_size,
@@ -159,7 +159,7 @@ class QATNRegressor(nn.Module):
 
         regressors = [SeqRegressor(1, self.quantiles, self.compute_dtype) for _ in range(self.features)]
 
-        x_t, x_f = qatn(x)
+        x_t, x_f = qatn(x, train)
         t_repr = jnp.mean(x_t, axis=1).astype(self.compute_dtype)
         f_global = jnp.mean(x_f, axis=1).astype(self.compute_dtype)
 

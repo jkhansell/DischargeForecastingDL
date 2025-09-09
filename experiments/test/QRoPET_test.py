@@ -57,7 +57,7 @@ def test_model():
     out_stations = np.array([cols["08166200"]])
 
     time_window = 128        # 15*4*64 hours of context 
-    horizons = (4*np.array([2, 4, 8, 16, 32]))  # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
+    horizons = (4*np.array([2, 4, 8, 12, 24]))  # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
 
 
     X, Y, Y_idx = build_multi_horizon_dataset(Q, in_stations, out_stations, time_window, horizons)
@@ -80,13 +80,13 @@ def test_model():
     n_total_devices = jax.device_count()         # 8 total
     print(f"Host {jax.process_index()} sees {n_local_devices} local devices")
 
-    per_device_batch_size = 128
+    per_device_batch_size = 64
     batch_size = per_device_batch_size * jax.device_count()
     for split in [train, val, test]:
         split["x"] = trim_to_batches(split["x"], per_device_batch_size)
         split["y"] = trim_to_batches(split["y"], per_device_batch_size)
 
-    num_epochs = 20
+    num_epochs = 15
 
     in_features = train["x"].shape[-1]
     out_features = train["y"].shape[-2]
@@ -100,27 +100,25 @@ def test_model():
         d_model = hidden_size, 
         num_heads = 4, 
         mlp_dim = 128, 
-        num_layers = 4, 
+        num_layers = 4,
         out_features = out_features, 
         n_quantiles = len(quantiles)
     )
 
     params = model.init(key, x)
-
+    
     steps_per_epoch = len(train["x"]) // batch_size
     total_steps = num_epochs * steps_per_epoch
-    warmup_steps = 500
-
     fractions = [0.2, 0.3, 0.5]  # adjust as needed
     decay_steps = [int(f * total_steps) for f in fractions]
 
     cosine_kwargs = [
         dict(init_value=1e-6, peak_value=1e-3, warmup_steps=500,
-            decay_steps=decay_steps[0], end_value=2.5e-4),
+            decay_steps=decay_steps[0], end_value=1e-4),
         dict(init_value=1e-6, peak_value=5e-4, warmup_steps=200,
-            decay_steps=decay_steps[1], end_value=7.5e-5),
-        dict(init_value=1e-6, peak_value=1e-4, warmup_steps=0,
-            decay_steps=decay_steps[2], end_value=1e-5),
+            decay_steps=decay_steps[1], end_value=1e-5),
+        dict(init_value=1e-6, peak_value=5e-5, warmup_steps=0,
+            decay_steps=decay_steps[2], end_value=5e-6),
     ]
 
     schedule = optax.sgdr_schedule(cosine_kwargs)
@@ -157,16 +155,13 @@ def test_model():
 
     state = ModelTrainState.create(apply_fn=model.apply, params=params,tx=tx)
 
-    #horizon_weights = jnp.array([1.0, 1.1, 1.2, 1.5, 1.7]) 
-    #horizon_weights = jnp.array([1.0, 1.1, 1.1, 1.2, 1.2]) 
-    #horizon_weights = jnp.array([1.0, 1.1, 1.3, 1.5, 1.7]) 
     horizon_weights = jnp.array([1.0, 1.0, 1.0, 1.0, 1.0]) 
     horizon_weights /= jnp.mean(horizon_weights)
     loss_fn = lambda x,y: quantile_loss_complex(
-        x, y, quantiles, horizon_weights, crossing_penalty_coef=0.1, cov_weight=0.05, k=50
+        x, y, quantiles, horizon_weights, 
+        crossing_penalty_coef=0.2, cov_weight=0.75, k=100, mae_coef=1.0
     )
-
-
+    
     # Mesh
     mesh = Mesh(jax.devices(), ('batch',))
 
@@ -233,14 +228,11 @@ def test_model():
 
     num_horizons = medians.shape[1]
 
-    print("here")
-
     for i in range(num_horizons):
         y_med = medians[:, i]
         y_low = lows[:, i]
         y_high = highs[:, i]
         y_true = truths[:, i]
-
 
         # ----- Median metrics -----
         rmse = np.sqrt(np.mean((y_med - y_true)**2))
@@ -268,8 +260,8 @@ def test_model():
         min_val = min(y_true.min(), y_med.min())
         max_val = max(y_true.max(), y_med.max())
         ax.plot([min_val, max_val], [min_val, max_val], 'k--')
-        ax.set_xlabel("True Discharge [cfs]")
-        ax.set_ylabel("Forecasted Discharge [cfs]")
+        ax.set_xlabel("True Discharge [m^3/s]")
+        ax.set_ylabel("Forecasted Discharge [m^3/s]")
         ax.grid(alpha=0.3)
         ax.set_title(f"Horizon {horizons[i]//4}h")
         ax.set_aspect('equal')
@@ -287,15 +279,15 @@ def test_model():
         fig, ax = plt.subplots(figsize=(14,5))
 
         # Ground truth
-        ax.plot(y_true[80000:90000], label="Ground Truth", linewidth=2.5, linestyle="--", color="black")
+        ax.plot(y_true[70000:90000], label="Ground Truth", linewidth=2.5, linestyle="--", color="black")
 
         # Prediction median
-        ax.plot(y_med[80000:90000], label="Prediction (Mean)", linewidth=1, color="red")
+        ax.plot(y_med[70000:90000], label="Prediction (Mean)", linewidth=1, color="red")
 
         # Uncertainty band
         ax.fill_between(
-            np.arange(y_med[80000:90000].shape[0]),
-            y_low[80000:90000], y_high[80000:90000],
+            np.arange(y_med[70000:90000].shape[0]),
+            y_low[70000:90000], y_high[70000:90000],
             alpha=0.25, color="red", label="90% Prediction Interval"
         )
 

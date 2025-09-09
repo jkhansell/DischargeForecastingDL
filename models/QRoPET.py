@@ -62,12 +62,17 @@ class RotarySelfAttention(nn.Module):
         v = v.transpose(0, 2, 1, 3)
 
         # Apply RoPE
-        q = apply_rope(q)
-        k = apply_rope(k)
+        q = nn.elu(q) + 1
+        k = nn.elu(k) + 1
+
+        rot_q = apply_rope(q)
+        rot_k = apply_rope(k)
 
         # Attention scores
-        attn_scores = jnp.einsum('...id,...jd->...ij', q, k) / jnp.sqrt(head_dim)
-        attn_weights = nn.softmax(attn_scores, axis=-1)
+        attn_num = jnp.einsum('...id,...jd->...ij', rot_q, rot_k)
+        attn_denom = jnp.einsum('...id,...jd->...ij', q, k)
+        
+        attn_weights = attn_num / attn_denom
         attn_weights = nn.Dropout(self.dropout)(attn_weights, deterministic=not train)
 
         # Weighted sum
@@ -138,12 +143,48 @@ class TransformerEncoder(nn.Module):
 # ------------------------------
 class SeqRegressor(nn.Module):
     quantiles: int
-    hidden_size: int
 
     @nn.compact
     def __call__(self, x):
-        out = nn.Dense(self.quantiles)(x)
-        return out.astype(jnp.float32)  # final output float32
+        x = nn.Dense(4*self.quantiles)(x)
+        x = nn.leaky_relu(x)
+        x = nn.Dense(self.quantiles)(x)
+        return x.astype(jnp.float32)
+
+class QRoPETRegressor(nn.Module):
+    d_model: int
+    num_heads: int
+    mlp_dim: int
+    num_layers: int
+    n_quantiles: int
+    out_features: int
+    dropout: float = 0.1
+
+    def setup(self):
+        self.regressors = [SeqRegressor(self.n_quantiles) for _ in range(self.out_features)]
+        self.tencoder =  TransformerEncoder(
+            d_model=self.d_model,
+            num_heads=self.num_heads,
+            mlp_dim=self.mlp_dim,
+            num_layers=self.num_layers,
+            dropout=self.dropout
+        )
+        self.dense1 = nn.Dense(self.d_model)  # Input embedding
+
+    def __call__(self, x, train=True):
+        # Create one regression head per feature
+        
+        x = self.dense1(x)
+        self.tencoder(x, train=train)
+        x = x[:,-1, :] #jnp.mean(x, axis=1)
+        out = jnp.stack([regressor(x) for regressor in self.regressors], axis=1)
+
+        return out
+
+# -----------------------------
+# 5. Full Time Series Transformer
+# -----------------------------
+"""
 
 class QRoPETRegressor(nn.Module):
     d_model: int
@@ -156,7 +197,7 @@ class QRoPETRegressor(nn.Module):
 
     @nn.compact
     def __call__(self, x, train=True):
-        regressors = [SeqRegressor(quantiles=self.n_quantiles, hidden_size=self.d_model) for _ in range(self.out_features)]
+        regressors = [SeqRegressor(quantiles=self.n_quantiles) for _ in range(self.out_features)]
         
         # Input embedding
         x = nn.Dense(self.d_model)(x)  # (batch, Nwindow, d_model)
@@ -165,7 +206,7 @@ class QRoPETRegressor(nn.Module):
         cls_tokens = self.param(
             "cls_tokens",
             nn.initializers.normal(stddev=0.05),
-            (1, self.out_features, self.d_model)
+            (1, 1, self.d_model)
         )
 
         cls_tokens = jnp.tile(cls_tokens, (x.shape[0], 1, 1))  # (batch, nhorizons, d_model)
@@ -183,53 +224,12 @@ class QRoPETRegressor(nn.Module):
         )(x, train=train)
 
         # Extract CLS outputs (first n_quantiles positions)
-        x_cls = x[:, :self.out_features, :]  # (batch, nhorizons, d_model)
+        x_cls = x[:, 0, :]  # (batch, nhorizons, d_model)
 
         # Map CLS outputs to features
         #out = nn.Dense(self.out_features)(x_cls)  # (batch, n_quantiles, out_features)
         
-        out = jnp.stack([regressor(x_cls[:,i,:]) for i, regressor in enumerate(regressors)], axis=1)
+        out = jnp.stack([regressor(x_cls) for i, regressor in enumerate(regressors)], axis=1)
 
         return out
-        
-# -----------------------------
-# 5. Full Time Series Transformer
-# -----------------------------
-"""
-class QRoPETRegressor(nn.Module):
-    d_model: int
-    num_heads: int
-    mlp_dim: int
-    num_layers: int
-    n_quantiles: int
-    out_features: int
-    dropout: float = 0.1
-
-    @nn.compact
-    def __call__(self, x, train=True):
-        # Create one regression head per feature
-        regressors = [SeqRegressor(self.n_quantiles) for _ in range(self.out_features)]
-        
-        # x: (batch, Nwindow, Nfeatures)
-        x = nn.Dense(self.d_model)(x)  # Input embedding
-        # x: (batch, Nwindow, self.d_model)
-
-        # Transformer encoder stack with RoPE attention
-        x = TransformerEncoder(
-            d_model=self.d_model,
-            num_heads=self.num_heads,
-            mlp_dim=self.mlp_dim,
-            num_layers=self.num_layers,
-            dropout=self.dropout
-        )(x, train=train)
-
-        x_last = x[:,-1,:]
-
-
-        # Apply each head to the embedding
-        out = jnp.stack([regressor(x_last) for regressor in regressors], axis=1)
-        # out shape: (batch, n_features, n_quantiles)
-        return out
-
-
 """

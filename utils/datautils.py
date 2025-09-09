@@ -74,7 +74,7 @@ def get_data(path, sites, nan_sites):
     try: 
         Q = pd.read_csv(path)
     except:
-        Q = get_discharges(sites, nan_sites, service="iv", start_date="2005-01-01", end_date="2025-01-31")        
+        Q = get_discharges(sites, nan_sites, service="iv", start_date="2005-01-01", end_date="2025-08-29")        
         Q.to_csv("./data/Q_raw.csv")
 
     Q_filled = pd.DataFrame()
@@ -126,7 +126,7 @@ def feature_engineering(path, sites, nan_sites):
 
     Q = Q.select(pl.col(pl.Float64))
     Q = Q.select([
-        pl.col(c).mul(CFS2M3S).log10().alias(c) #removed log10
+        pl.col(c).log10().alias(c) #removed log10
         for c in Q.columns 
     ])
 
