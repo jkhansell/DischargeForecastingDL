@@ -51,16 +51,23 @@ class SeqRegressor(nn.Module):
 
 
 class LSTMRegressor(nn.Module):
-    features: int
-    quantiles: int
+    out_features: int
+    n_quantiles: int
     hidden_size: int
     dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
     def __call__(self, x, *, train: bool = True):
         lstm = LSTM(hidden_size=self.hidden_size, dtype=self.dtype)
-        regressors = [SeqRegressor(quantiles=self.n_quantiles, hidden_size=self.d_model) for _ in range(self.out_features)]
+        regressors = [SeqRegressor(quantiles=self.n_quantiles, hidden_size=self.hidden_size) for _ in range(self.out_features)]
 
+        mlp = nn.Sequential([
+            nn.Dense(2*self.hidden_size),
+            nn.leaky_relu,
+            nn.Dense(self.hidden_size)
+        ])
+
+        x = mlp(x)
         x = lstm(x)
         out = jnp.stack([regressor(x[:, -1, :]) for regressor in regressors], axis=1)
 

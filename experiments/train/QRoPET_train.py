@@ -47,7 +47,7 @@ from models.QRoPET import QRoPETRegressor
 # Previously exploring the data some stations report the discharge variable in another column of the data frame
 
 sites = ["08165300", "08165500", "08166000", "08166140", "08166200"]
-nan_sites = ["08166140", "08166200"]
+nan_sites = ["08166140", "08166200", "08165500"]
 
 def train_model():
     Q, cols, time = feature_engineering("./data/Q_raw.csv", sites, nan_sites)
@@ -55,13 +55,12 @@ def train_model():
     in_stations = np.array([i for i in range(Q.shape[1])])
     out_stations = np.array([cols["08166200"]])
 
-    time_window = 256       # 4*64 hours of context 
+    time_window = 128       # 4*64 hours of context 
     horizons = (4*np.array([2, 4, 8, 12, 24]))  # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
 
-
     print(f"Time Window: {time_window} | Horizons: {horizons}")
-    X, Y, Y_idx = build_multi_horizon_dataset(Q, in_stations, out_stations, time_window, horizons)
-    train, val, test, times = create_train_val_test(X, Y, time)
+    X, Y, T = build_multi_horizon_dataset(Q, time, in_stations, out_stations, time_window, horizons)
+    train, val, test = create_train_val_test(X, Y, T)
 
     # initialize distributed environment
     visible_devices = [int(gpu) for gpu in os.environ['CUDA_VISIBLE_DEVICES'].split(',')]          
@@ -99,7 +98,7 @@ def train_model():
         d_model = hidden_size, 
         num_heads = 4, 
         mlp_dim = 128, 
-        num_layers = 4,
+        num_layers = 12,
         out_features = out_features, 
         n_quantiles = len(quantiles)
     )
@@ -174,11 +173,13 @@ def train_model():
         val_loss = []
 
         for batch in train_prefetch:
+            batch = {k: v for k, v in batch.items() if k != "time"}
             state, loss = p_train_step(state, batch, key)
             train_loss.append(loss)
 
         # Validation phase
         for batch in val_prefetch:
+            batch = {k: v for k, v in batch.items() if k != "time"}
             loss, _ = p_eval_step(state, batch)
             val_loss.append(loss)
 

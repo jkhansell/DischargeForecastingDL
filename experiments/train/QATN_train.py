@@ -120,7 +120,7 @@ def train_model():
 
     schedule = optax.sgdr_schedule(cosine_kwargs)
 
-    tx = optax.adamw(learning_rate=schedule, weight_decay=1e-5)
+    tx = optax.adamw(learning_rate=schedule, weight_decay=1e-4)
     state = ModelTrainState.create(apply_fn=model.apply, params=params,tx=tx)
     
     horizon_weights = jnp.array([1.0, 1.0, 1.0, 1.0, 1.0]) 

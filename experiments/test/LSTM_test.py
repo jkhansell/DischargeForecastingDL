@@ -47,7 +47,7 @@ from models.LSTM import LSTMRegressor
 # Previously exploring the data some stations report the discharge variable in another column of the data frame
 
 sites = ["08165300", "08165500", "08166000", "08166140", "08166200"]
-nan_sites = ["08166140", "08166200"]
+nan_sites = ["08166140", "08166200", "08165500"]
 
 def test_model():
     Q, cols, time = feature_engineering("./data/Q_raw.csv", sites, nan_sites)
@@ -55,13 +55,15 @@ def test_model():
     in_stations = np.array([i for i in range(Q.shape[1])])
     out_stations = np.array([cols["08166200"]])
 
-    time_window = 128        # 15*4*64 hours of context 
-    horizons = (4*np.array([2, 4, 8, 16, 32]))  # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
+    time_window = 256       # 15*4*64 hours of context 
+    horizons = (4*np.array([2, 4, 8, 12, 24]))  # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
 
+    X, Y, T = build_multi_horizon_dataset(Q, time, in_stations, out_stations, time_window, horizons)
+
+    print(T)
+
+    train, val, test = create_train_val_test(X, Y, T)
     print(f"Time Window: {time_window} | Horizons: {horizons}")
-
-    X, Y, Y_idx = build_multi_horizon_dataset(Q, in_stations, out_stations, time_window, horizons)
-    train, val, test, times = create_train_val_test(X, Y, time)
 
     # initialize distributed environment
     visible_devices = [int(gpu) for gpu in os.environ['CUDA_VISIBLE_DEVICES'].split(',')]          
@@ -85,7 +87,7 @@ def test_model():
         split["x"] = trim_to_batches(split["x"], per_device_batch_size)
         split["y"] = trim_to_batches(split["y"], per_device_batch_size)
 
-    num_epochs = 10
+    num_epochs = 15
 
     in_features = train["x"].shape[-1]
     out_features = train["y"].shape[-2]
@@ -96,8 +98,8 @@ def test_model():
     x = jnp.zeros((batch_size, time_window, in_features))
 
     model = LSTMRegressor(
-        features=out_features, 
-        quantiles=len(quantiles), 
+        out_features=out_features, 
+        n_quantiles=len(quantiles), 
         hidden_size=hidden_size
     )
 
@@ -136,7 +138,6 @@ def test_model():
     fmt = '%Y_%m_%d'
     checkpoint_dir = os.path.abspath("./checkpoints")
     checkpoint_dir = os.path.join(checkpoint_dir, f"LSTM/model_{datetime.today().strftime(fmt)}")
-
     options = ocp.CheckpointManagerOptions(max_to_keep=2)
 
     abstract_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, params)
@@ -156,7 +157,8 @@ def test_model():
     horizon_weights = jnp.array([1.0, 1.0, 1.0, 1.0, 1.0]) 
     horizon_weights /= jnp.mean(horizon_weights)
     loss_fn = lambda x,y: quantile_loss_complex(
-        x, y, quantiles, horizon_weights, crossing_penalty_coef=0.25
+        x, y, quantiles, horizon_weights, 
+        crossing_penalty_coef=0.2, cov_weight=1.0, k=100, mae_coef=1.0
     )
 
     print(jax.devices())
@@ -188,18 +190,23 @@ def test_model():
     lows = []
     highs = []
     truths = []
+    times = []
         
     for batch in test_prefetch:
+        batchtime = batch["time"]
+        batch = {k: v for k, v in batch.items() if k != "time"}
         loss, preds = p_eval_step(state, batch)
         test_loss.append(np.mean(loss))
         
         # append for graphing
 
+        times.append(np.asarray(batchtime.reshape(-1, batchtime.shape[-1])))
         truths.append(np.asarray(batch["y"].reshape(-1, batch["y"].shape[-2])))
         lows.append(np.asarray(preds[..., 0].reshape(-1, preds.shape[1])))
         medians.append(np.asarray(preds[..., 1].reshape(-1, preds.shape[1])))
         highs.append(np.asarray(preds[..., 2].reshape(-1, preds.shape[1])))
 
+    times = np.concatenate(times, axis=0)
     medians = np.concatenate(medians, axis=0)
     lows = np.concatenate(lows, axis=0)
     highs = np.concatenate(highs, axis=0)
@@ -223,6 +230,8 @@ def test_model():
     plt.close()
 
     num_horizons = medians.shape[1]
+    
+    records = []
 
     for i in range(num_horizons):
         y_med = medians[:, i]
@@ -240,8 +249,25 @@ def test_model():
         inside_interval = (y_true >= y_low) & (y_true <= y_high)
         picp = inside_interval.mean()
         mpiw = np.mean(y_high - y_low)
-        crps_proxy = np.mean(np.abs(y_true - y_med))  # simple CRPS proxy
         
+        # Kling-Gupta Efficiency
+        r = np.corrcoef(y_true, y_med)[0, 1]
+        alpha = np.std(y_med) / np.std(y_true)
+        beta = np.mean(y_med) / np.mean(y_true)
+        kge = 1 - np.sqrt((r - 1)**2 + (alpha - 1)**2 + (beta - 1)**2)
+
+        # Save row
+        records.append({
+            "horizon_h": horizons[i] // 4,
+            "RMSE": rmse,
+            "MAE": mae,
+            "R2": r2,
+            "MBE": mbe,
+            "KGE": kge,
+            "PICP": picp,
+            "MPIW": mpiw,
+        })
+
         # ----- Print nicely -----
         print(f"Horizon {horizons[i]//4}h:")
         print(f"  Median Metrics -> RMSE: {rmse:.3f}, MAE: {mae:.3f}, R²: {r2:.3f}, MBE: {mbe:.3f}")
@@ -249,9 +275,6 @@ def test_model():
         print("-"*60)
 
         fig, ax = plt.subplots(figsize=(8,6))
-
-        y_true = truths[:, i]
-        y_med = medians[:, i]
         
         #err = np.abs(y_true - y_med)
         #nquant = np.quantile(err, 0.99) # removing outlier spike see forecast prediction
@@ -274,24 +297,26 @@ def test_model():
 
         plt.close()
 
+    df = pd.DataFrame.from_records(records)
+    df.to_csv("./results/results_lstm.csv")
+
     for i in range(num_horizons):
         y_med = medians[:, i]
         y_low = lows[:, i]
         y_high = highs[:, i]
         y_true = truths[:, i]
-
+        t = times[:, i]
+        
         fig, ax = plt.subplots(figsize=(14,5))
 
         # Ground truth
-        ax.plot(y_true, label="Ground Truth", linewidth=2.5, linestyle="--", color="black")
+        ax.plot(t, y_true, label="Ground Truth", linewidth=2.5, linestyle="--", color="black")
 
         # Prediction median
-        ax.plot(y_med, label="Prediction (Median)", linewidth=1, color="red")
+        ax.plot(t, y_med, label="Prediction (Mean)", linewidth=1, color="red")
 
         # Uncertainty band
-        ax.fill_between(
-            np.arange(y_low.shape[0]),
-            y_low, y_high,
+        ax.fill_between(t, y_low, y_high,
             alpha=0.25, color="red", label="90% Prediction Interval"
         )
 
@@ -301,7 +326,8 @@ def test_model():
         ax.grid(alpha=0.25)
 
         fig.suptitle(f"LSTM Forecast - Horizon {horizons[i]//4}h")
-        fig.legend(loc="upper right")
+        ax.legend(loc='upper left', framealpha=0.9)
+
         fig.tight_layout()
 
         fig.savefig(f"images/LSTM/predictions_{i}.png", dpi=300)

@@ -6,8 +6,12 @@ import matplotlib.dates as mdates
 import re
 from datetime import datetime
 
-from utils.datautils import get_data, build_multi_horizon_dataset, fill_nans_with_random_walk
-
+from utils.datautils import (
+    get_data, build_multi_horizon_dataset, 
+    get_discharges, create_train_val_test,
+    batch_iterator, prefetch_batches, shard_batch, reshape_fn,
+    feature_engineering, trim_to_batches
+)
 
 # Define a mapping from window suffix to temporal length (in increasing order)
 temporal_order = {
@@ -53,7 +57,8 @@ def sort_key(col):
 # Previously exploring the data some stations report the discharge variable in another column of the data frame
 
 sites = ["08165300", "08165500", "08166000", "08166140", "08166200"]
-nan_sites = ["08166140", "08166200"]
+nan_sites = ["08166140", "08166200", "08165500"]
+
 
 def EDA():
     Q_raw, Q_filled = get_data("./data/Q_raw.csv", sites, nan_sites)
@@ -215,4 +220,9 @@ def OLDEDA():
         plt.close()
 
 if __name__ == "__main__":
-    EDA()
+    sites = ["08165300", "08165500", "08166000", "08166140", "08166200"]
+    nan_sites = ["08166140", "08166200", "08165500"]
+
+    Q, cols, time = feature_engineering("./data/Q_raw.csv", sites, nan_sites)
+
+    

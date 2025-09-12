@@ -47,7 +47,7 @@ from models.LSTM import LSTMRegressor
 # Previously exploring the data some stations report the discharge variable in another column of the data frame
 
 sites = ["08165300", "08165500", "08166000", "08166140", "08166200"]
-nan_sites = ["08166140", "08166200"]
+nan_sites = ["08166140", "08166200", "08165500"]
 
 def train_model():
     Q, cols, time = feature_engineering("./data/Q_raw.csv", sites, nan_sites)
@@ -56,12 +56,12 @@ def train_model():
     out_stations = np.array([cols["08166200"]])
 
     time_window = 128        # 15*4*64 hours of context 
-    horizons = (4*np.array([2, 4, 8, 16, 32]))  # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
+    horizons = (4*np.array([2, 4, 8, 12, 24]))  # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
 
     print(f"Time Window: {time_window} | Horizons: {horizons}")
 
-    X, Y, Y_idx = build_multi_horizon_dataset(Q, in_stations, out_stations, time_window, horizons)
-    train, val, test, times = create_train_val_test(X, Y, time)
+    X, Y, T = build_multi_horizon_dataset(Q, time, in_stations, out_stations, time_window, horizons)
+    train, val, test = create_train_val_test(X, Y, T)
 
     # initialize distributed environment
     visible_devices = [int(gpu) for gpu in os.environ['CUDA_VISIBLE_DEVICES'].split(',')]          
@@ -96,8 +96,8 @@ def train_model():
     x = jnp.zeros((batch_size, time_window, in_features))
 
     model = LSTMRegressor(
-        features=out_features, 
-        quantiles=len(quantiles), 
+        out_features=out_features, 
+        n_quantiles=len(quantiles), 
         hidden_size=hidden_size
     )
 
@@ -107,6 +107,9 @@ def train_model():
     steps_per_epoch = len(train["x"]) // batch_size
     total_steps = num_epochs * steps_per_epoch
     warmup_steps = 500
+
+    fractions = [0.2, 0.3, 0.5]  # adjust as needed
+    decay_steps = [int(f * total_steps) for f in fractions]
 
     cosine_kwargs = [
         dict(init_value=1e-6, peak_value=1e-3, warmup_steps=500,
@@ -121,11 +124,14 @@ def train_model():
     tx = optax.adamw(learning_rate=schedule, weight_decay=1e-5)
     state = ModelTrainState.create(apply_fn=model.apply, params=params,tx=tx)
 
-    horizon_weights = jnp.array([1.0, 1.1, 1.3, 1.5, 1.7]) 
+    horizon_weights = jnp.array([1.0, 1.0, 1.0, 1.0, 1.0]) 
     horizon_weights /= jnp.mean(horizon_weights)
+    
     loss_fn = lambda x,y: quantile_loss_complex(
-        x, y, quantiles, horizon_weights, crossing_penalty_coef=0.1, cov_weight=0.01, k=15
+        x, y, quantiles, horizon_weights, 
+        crossing_penalty_coef=0.2, cov_weight=1.0, k=100, mae_coef=1.0
     )
+
     mesh = Mesh(jax.devices(), ('batch',))
 
     # Partition specs
@@ -167,11 +173,13 @@ def train_model():
         val_loss = []
 
         for batch in train_prefetch:
+            batch = {k: v for k, v in batch.items() if k != "time"}
             state, loss = p_train_step(state, batch, key)
             train_loss.append(loss)
 
         # Validation phase
         for batch in val_prefetch:
+            batch = {k: v for k, v in batch.items() if k != "time"}
             loss, _ = p_eval_step(state, batch)
             val_loss.append(loss)
 

@@ -67,15 +67,18 @@ def get_discharges(sites, nan_sites, service="iv", start_date="2005-01-01", end_
             station_df = df.loc[site]
             data = station_df["00060_Mean"]
             Q[site] = data
-    return Q
+    return Q, df
     # bear in mind that the points are within 15 minute intervals
 
 def get_data(path, sites, nan_sites):
     try: 
         Q = pd.read_csv(path)
     except:
-        Q = get_discharges(sites, nan_sites, service="iv", start_date="2005-01-01", end_date="2025-08-29")        
+        Q, df = get_discharges(sites, nan_sites, service="iv", start_date="2005-01-01", end_date="2025-08-31")        
         Q.to_csv("./data/Q_raw.csv")
+        df.to_csv("./data/df_raw.csv")
+        #print(Q.isna().sum())
+        #print(df.isna().sum())
 
     Q_filled = pd.DataFrame()
     for col in Q.columns:
@@ -126,7 +129,8 @@ def feature_engineering(path, sites, nan_sites):
 
     Q = Q.select(pl.col(pl.Float64))
     Q = Q.select([
-        pl.col(c).log10().alias(c) #removed log10
+        pl.col(c).log10().alias(c)
+        
         for c in Q.columns 
     ])
 
@@ -156,40 +160,47 @@ def feature_engineering(path, sites, nan_sites):
 
     return Q.to_numpy(), cols, time
 
-def build_multi_horizon_dataset(Q, in_stations, out_stations, p, horizons):
+def build_multi_horizon_dataset(Q, time, in_stations, out_stations, p, horizons):
     """
-    Build input matrix X and multi-horizon target Y for training.
+    Build input matrix X, multi-horizon target Y, and corresponding prediction times.
 
     Parameters:
     - Q: np.array of shape (time_steps, stations)
+    - time: array-like of length time_steps, datetime or numeric
     - in_stations: list of input station indices
     - out_stations: list of output station indices
     - p: int, number of lags (time steps)
     - horizons: list of prediction horizons (steps ahead)
-    - time: optional array-like of length time_steps, datetime or numeric
 
     Returns:
     - X: np.array of shape (num_samples, p, len(in_stations))
-    - Y: np.array of shape (num_samples, len(horizons))
-    - T: np.array of length num_samples with timestamps for the last horizon (optional)
+    - Y: np.array of shape (num_samples, len(horizons), len(out_stations))
+    - T: np.array of shape (num_samples, len(horizons)) with timestamps for each horizon
     """
     time_steps, num_stations = Q.shape
 
+    # valid range for constructing samples
     max_start = time_steps - p - np.max(horizons) + 1
     start_indices = np.arange(max_start)
 
+    # lag and horizon indexing
     lag_indices = np.arange(p)
     horizons = np.array(horizons)
 
+    # input (lags) and output (horizons) indices
     X_idx = start_indices[:, None] + lag_indices[None, :]
     Y_idx = X_idx[:, -1][:, None] + horizons[None, :]
 
-    X = Q[X_idx][:,:,in_stations]
-    Y = Q[Y_idx][:,:,out_stations]
+    # build inputs and outputs
+    X = Q[X_idx][:, :, in_stations]                       # (num_samples, p, len(in_stations))
+    Y = Q[Y_idx][:, :, out_stations]                      # (num_samples, len(horizons), len(out_stations))
 
-    return X, Y, Y_idx
+    # build time matrix aligned with Y
+    T = np.asarray(time)[Y_idx]                           # (num_samples, len(horizons))
 
-def create_train_val_test(X, Y, time, train_frac=0.7, val_frac=0.15):
+    return X, Y, T
+
+def create_train_val_test(X, Y, T, train_frac=0.7, val_frac=0.15):
     """
     Create train, validation, and test sets for 
     X: (Nt, N_stations, window_size) 
@@ -203,24 +214,23 @@ def create_train_val_test(X, Y, time, train_frac=0.7, val_frac=0.15):
     train_end = int(Nt * train_frac)
     val_end = int(Nt * (train_frac + val_frac))
 
-    traintimes = time[:train_end]
-    valtimes = time[train_end:val_end]
-    testtimes = time[val_end:] 
-
     train = {
         "x": X[:train_end],
         "y": Y[:train_end],
+        "time": T[:train_end]
     }
     val = {
         "x": X[train_end:val_end],
         "y": Y[train_end:val_end],
+        "time": T[train_end:val_end]
     }
     test = {
         "x": X[val_end:],
         "y": Y[val_end:],
+        "time": T[val_end:]
     }
 
-    return train, val, test, (traintimes, valtimes, testtimes)
+    return train, val, test
 
 def trim_to_batches(arr, global_batch_size):
     """
@@ -233,9 +243,6 @@ def trim_to_batches(arr, global_batch_size):
 
     return arr
     
-
-
-
 
 def batch_iterator(data, batch_size, shuffle=True):
     """
@@ -259,6 +266,7 @@ def batch_iterator(data, batch_size, shuffle=True):
         batch = {
             "x": jnp.array(data["x"][idx]),
             "y": jnp.array(data["y"][idx]),
+            "time": data["time"][idx]
         }
         yield batch
 
@@ -271,7 +279,10 @@ def prefetch_batches(generator, prefetch_size=2):
     def producer():
         for batch in generator:
             # Move batch to device
-            batch_device = {k: jax.device_put(v) for k, v in batch.items()}
+            batch_device = {
+                k: (jax.device_put(v) if k != "time" else v)
+                for k, v in batch.items()
+            }
             q.put(batch_device)
         q.put(None)  # Sentinel to indicate end
 

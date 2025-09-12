@@ -47,7 +47,8 @@ from models.LTCN import LTCNRegressor
 # Previously exploring the data some stations report the discharge variable in another column of the data frame
 
 sites = ["08165300", "08165500", "08166000", "08166140", "08166200"]
-nan_sites = ["08166140", "08166200"]
+nan_sites = ["08166140", "08166200", "08165500"]
+
 
 def train_model():
     Q, cols, time = feature_engineering("./data/Q_raw.csv", sites, nan_sites)
@@ -56,12 +57,12 @@ def train_model():
     out_stations = np.array([cols["08166200"]])
 
     time_window = 128        # 15*4*64 hours of context 
-    horizons = (4*np.array([2, 4, 8, 16, 32]))  # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
+    horizons = (4*np.array([2, 4, 8, 12, 24]))  # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
 
     print(f"Time Window: {time_window} | Horizons: {horizons}")
 
-    X, Y, Y_idx = build_multi_horizon_dataset(Q, in_stations, out_stations, time_window, horizons)
-    train, val, test, times = create_train_val_test(X, Y, time)
+    X, Y, T = build_multi_horizon_dataset(Q, time, in_stations, out_stations, time_window, horizons)
+    train, val, test = create_train_val_test(X, Y, T)
 
     # initialize distributed environment
     visible_devices = [int(gpu) for gpu in os.environ['CUDA_VISIBLE_DEVICES'].split(',')]          
@@ -79,13 +80,13 @@ def train_model():
     n_total_devices = jax.device_count()         # 8 total
     print(f"Host {jax.process_index()} sees {n_local_devices} local devices")
 
-    per_device_batch_size = 64
+    per_device_batch_size = 128
     batch_size = per_device_batch_size * jax.device_count()
     for split in [train, val, test]:
         split["x"] = trim_to_batches(split["x"], per_device_batch_size)
         split["y"] = trim_to_batches(split["y"], per_device_batch_size)
 
-    num_epochs = 20
+    num_epochs = 15
 
     in_features = train["x"].shape[-1]
     out_features = train["y"].shape[-2]
@@ -96,8 +97,8 @@ def train_model():
     x = jnp.zeros((batch_size, time_window, in_features))
 
     model = LTCNRegressor(
-        features=out_features, 
-        quantiles=len(quantiles), 
+        out_features=out_features, 
+        n_quantiles=len(quantiles), 
         hidden_size=hidden_size,
         dt=0.25
     )
@@ -125,11 +126,13 @@ def train_model():
 
     state = ModelTrainState.create(apply_fn=model.apply, params=params,tx=tx)
 
-    horizon_weights = jnp.array([1.0, 1.1, 1.3, 1.5, 1.7]) 
+    horizon_weights = jnp.array([1.0, 1.0, 1.0, 1.0, 1.0]) 
     horizon_weights /= jnp.mean(horizon_weights)
     loss_fn = lambda x,y: quantile_loss_complex(
-        x, y, quantiles, horizon_weights, crossing_penalty_coef=0.1, cov_weight=0.01, k=15
+        x, y, quantiles, horizon_weights, 
+        crossing_penalty_coef=0.2, cov_weight=1.0, k=100, mae_coef=1.0
     )
+    
 
     mesh = Mesh(jax.devices(), ('batch',))
 
@@ -172,11 +175,13 @@ def train_model():
         val_loss = []
 
         for batch in train_prefetch:
+            batch = {k: v for k, v in batch.items() if k != "time"}
             state, loss = p_train_step(state, batch, key)
             train_loss.append(loss)
 
         # Validation phase
         for batch in val_prefetch:
+            batch = {k: v for k, v in batch.items() if k != "time"}
             loss, _ = p_eval_step(state, batch)
             val_loss.append(loss)
 

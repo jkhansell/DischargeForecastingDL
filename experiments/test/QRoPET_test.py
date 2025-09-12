@@ -48,7 +48,7 @@ from models.QRoPET import QRoPETRegressor
 # Previously exploring the data some stations report the discharge variable in another column of the data frame
 
 sites = ["08165300", "08165500", "08166000", "08166140", "08166200"]
-nan_sites = ["08166140", "08166200"]
+nan_sites = ["08166140", "08166200", "08165500"]
 
 def test_model():
     Q, cols, time = feature_engineering("./data/Q_raw.csv", sites, nan_sites)
@@ -56,12 +56,14 @@ def test_model():
     in_stations = np.array([i for i in range(Q.shape[1])])
     out_stations = np.array([cols["08166200"]])
 
-    time_window = 128        # 15*4*64 hours of context 
+    time_window = 256       # 15*4*64 hours of context 
     horizons = (4*np.array([2, 4, 8, 12, 24]))  # Multi horizon prediction [2, 4, 8, 16, 32] h in advance
 
+    X, Y, T = build_multi_horizon_dataset(Q, time, in_stations, out_stations, time_window, horizons)
 
-    X, Y, Y_idx = build_multi_horizon_dataset(Q, in_stations, out_stations, time_window, horizons)
-    train, val, test, times = create_train_val_test(X, Y, time)
+    print(T)
+
+    train, val, test = create_train_val_test(X, Y, T)
     print(f"Time Window: {time_window} | Horizons: {horizons}")
 
     # initialize distributed environment
@@ -100,7 +102,7 @@ def test_model():
         d_model = hidden_size, 
         num_heads = 4, 
         mlp_dim = 128, 
-        num_layers = 4,
+        num_layers = 12,
         out_features = out_features, 
         n_quantiles = len(quantiles)
     )
@@ -138,7 +140,6 @@ def test_model():
     fmt = '%Y_%m_%d'
     checkpoint_dir = os.path.abspath("./checkpoints")
     checkpoint_dir = os.path.join(checkpoint_dir, f"QRoPET/model_{datetime.today().strftime(fmt)}")
-    #checkpoint_dir="/work/jovillalobos/hidrologia/DischargeForecastingDL/checkpoints/QRoPET/model_2025_09_05/"
 
     options = ocp.CheckpointManagerOptions(max_to_keep=2)
 
@@ -159,7 +160,7 @@ def test_model():
     horizon_weights /= jnp.mean(horizon_weights)
     loss_fn = lambda x,y: quantile_loss_complex(
         x, y, quantiles, horizon_weights, 
-        crossing_penalty_coef=0.2, cov_weight=0.75, k=100, mae_coef=1.0
+        crossing_penalty_coef=0.2, cov_weight=1.0, k=100, mae_coef=1.0
     )
     
     # Mesh
@@ -189,33 +190,36 @@ def test_model():
     lows = []
     highs = []
     truths = []
+    times = []
 
     for batch in test_prefetch:
+        batchtime = batch["time"]
+        batch = {k: v for k, v in batch.items() if k != "time"}
         loss, preds = p_eval_step(state, batch)
         test_loss.append(np.mean(loss))
         
         # append for graphing
 
-        truths.append(np.asarray(batch["y"].reshape(-1, batch["y"].shape[-2])))
-        
+        times.append(np.asarray(batchtime.reshape(-1, batchtime.shape[-1])))
+        truths.append(np.asarray(batch["y"].reshape(-1, batch["y"].shape[-2])))        
         lows.append(np.asarray(preds[..., 0].reshape(-1, preds.shape[1])))
         medians.append(np.asarray(preds[..., 1].reshape(-1, preds.shape[1])))
         highs.append(np.asarray(preds[..., 2].reshape(-1, preds.shape[1])))
 
     # Test data analysis
 
-    medians = np.concatenate(medians, axis=0)
-    lows = np.concatenate(lows, axis=0)
-    highs = np.concatenate(highs, axis=0)
+    logmedians = np.concatenate(medians, axis=0)
+    loglows = np.concatenate(lows, axis=0)
+    loghighs = np.concatenate(highs, axis=0)
+    logtruths = np.concatenate(truths, axis=0)
 
-
-    truths = np.concatenate(truths, axis=0)
+    times = np.concatenate(times, axis=0)
     test_loss = np.array(test_loss)
 
-    medians = 10**medians
-    lows = 10**lows
-    highs = 10**highs
-    truths = 10**truths
+    medians = 10**logmedians
+    lows = 10**loglows
+    highs = 10**loghighs
+    truths = 10**logtruths
 
     #nquant = np.quantile(test_loss, 0.99)
     #test_loss = test_loss[test_loss < nquant] 
@@ -228,12 +232,15 @@ def test_model():
 
     num_horizons = medians.shape[1]
 
+    records = []
+
     for i in range(num_horizons):
         y_med = medians[:, i]
         y_low = lows[:, i]
         y_high = highs[:, i]
         y_true = truths[:, i]
-
+        t = times[:, i]
+        
         # ----- Median metrics -----
         rmse = np.sqrt(np.mean((y_med - y_true)**2))
         mae = np.mean(np.abs(y_med - y_true))
@@ -244,8 +251,25 @@ def test_model():
         inside_interval = (y_true >= y_low) & (y_true <= y_high)
         picp = inside_interval.mean()
         mpiw = np.mean(y_high - y_low)
-        crps_proxy = np.mean(np.abs(y_true - y_med))  # simple CRPS proxy
         
+        # Kling-Gupta Efficiency
+        r = np.corrcoef(y_true, y_med)[0, 1]
+        alpha = np.std(y_med) / np.std(y_true)
+        beta = np.mean(y_med) / np.mean(y_true)
+        kge = 1 - np.sqrt((r - 1)**2 + (alpha - 1)**2 + (beta - 1)**2)
+
+        # Save row
+        records.append({
+            "horizon_h": horizons[i] // 4,
+            "RMSE": rmse,
+            "MAE": mae,
+            "R2": r2,
+            "MBE": mbe,
+            "KGE": kge,
+            "PICP": picp,
+            "MPIW": mpiw,
+        })
+
         # ----- Print nicely -----
         print(f"Horizon {horizons[i]//4}h:")
         print(f"  Median Metrics -> RMSE: {rmse:.3f}, MAE: {mae:.3f}, R²: {r2:.3f}, MBE: {mbe:.3f}")
@@ -260,8 +284,8 @@ def test_model():
         min_val = min(y_true.min(), y_med.min())
         max_val = max(y_true.max(), y_med.max())
         ax.plot([min_val, max_val], [min_val, max_val], 'k--')
-        ax.set_xlabel("True Discharge [m^3/s]")
-        ax.set_ylabel("Forecasted Discharge [m^3/s]")
+        ax.set_xlabel("True Discharge [cfs]")
+        ax.set_ylabel("Forecasted Discharge [cfs]")
         ax.grid(alpha=0.3)
         ax.set_title(f"Horizon {horizons[i]//4}h")
         ax.set_aspect('equal')
@@ -269,36 +293,36 @@ def test_model():
         fig.savefig(f"images/QRoPET/ScatterPlots_{i}.png", dpi=250)
         plt.close()
 
-    print("here")
+    df = pd.DataFrame.from_records(records)
+    df.to_csv("./results/results_qropet.csv")
 
     for i in range(num_horizons):
         y_med = medians[:, i]
         y_low = lows[:, i]
         y_high = highs[:, i]
         y_true = truths[:, i]
+        t = times[:, i]
+        
         fig, ax = plt.subplots(figsize=(14,5))
 
         # Ground truth
-        ax.plot(y_true[70000:90000], label="Ground Truth", linewidth=2.5, linestyle="--", color="black")
+        ax.plot(t, y_true, label="Ground Truth", linewidth=2.5, linestyle="--", color="black")
 
         # Prediction median
-        ax.plot(y_med[70000:90000], label="Prediction (Mean)", linewidth=1, color="red")
+        ax.plot(t, y_med, label="Prediction (Mean)", linewidth=1, color="red")
 
         # Uncertainty band
-        ax.fill_between(
-            np.arange(y_med[70000:90000].shape[0]),
-            y_low[70000:90000], y_high[70000:90000],
+        ax.fill_between(t, y_low, y_high,
             alpha=0.25, color="red", label="90% Prediction Interval"
         )
 
-        ax.set_xlabel("Time point")
-        ax.set_ylabel("Flow Discharge [m^3/s]")
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Flow Discharge [cfs]")
         ax.set_yscale("log")
         ax.grid(alpha=0.25)
 
         fig.suptitle(f"QRoPET Forecast - Horizon {horizons[i]//4}h")
-        fig.legend(loc="upper right")
-        fig.tight_layout()
-
+        ax.legend(loc='upper left', framealpha=0.9)
+        plt.tight_layout()
         fig.savefig(f"images/QRoPET/predictions_{i}.png", dpi=300)
         plt.close()

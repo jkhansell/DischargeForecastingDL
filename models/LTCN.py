@@ -88,8 +88,8 @@ class SeqRegressor(nn.Module):
 
 
 class LTCNRegressor(nn.Module):
-    features: int
-    quantiles: int
+    out_features: int
+    n_quantiles: int
     hidden_size: int
     dt: float
     dtype: jnp.dtype = jnp.bfloat16
@@ -97,11 +97,11 @@ class LTCNRegressor(nn.Module):
     @nn.compact
     def __call__(self, x, *, train: bool = True):
         ltcn = LTCN(hidden_size=self.hidden_size, dtype=self.dtype)
-        regressors = [SeqRegressor(quantiles=self.n_quantiles, hidden_size=self.d_model) for _ in range(self.out_features)]
+        regressors = [SeqRegressor(quantiles=self.n_quantiles, hidden_size=self.hidden_size) for _ in range(self.out_features)]
 
         x = ltcn(x, self.dt, train=train)
 
-        out = jnp.stack([regressor(x[:, -1, :], train=train) for regressor in regressors], axis=1)
+        out = jnp.stack([regressor(x[:, -1, :]) for regressor in regressors], axis=1)
         return out.astype(jnp.float32)
 
 

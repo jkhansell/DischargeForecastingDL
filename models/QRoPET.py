@@ -169,67 +169,20 @@ class QRoPETRegressor(nn.Module):
             num_layers=self.num_layers,
             dropout=self.dropout
         )
-        self.dense1 = nn.Dense(self.d_model)  # Input embedding
+        
+        self.mlp = nn.Sequential([
+            nn.Dense(2*self.d_model),
+            nn.leaky_relu,
+            nn.Dense(self.d_model)
+        ])
 
     def __call__(self, x, train=True):
-        # Create one regression head per feature
-        
-        x = self.dense1(x)
+    
+        x = self.mlp(x)
         self.tencoder(x, train=train)
-        x = x[:,-1, :] #jnp.mean(x, axis=1)
+        
+        x = x[:,-1, :]
         out = jnp.stack([regressor(x) for regressor in self.regressors], axis=1)
 
         return out
 
-# -----------------------------
-# 5. Full Time Series Transformer
-# -----------------------------
-"""
-
-class QRoPETRegressor(nn.Module):
-    d_model: int
-    num_heads: int
-    mlp_dim: int
-    num_layers: int
-    n_quantiles: int
-    out_features: int
-    dropout: float = 0.1
-
-    @nn.compact
-    def __call__(self, x, train=True):
-        regressors = [SeqRegressor(quantiles=self.n_quantiles) for _ in range(self.out_features)]
-        
-        # Input embedding
-        x = nn.Dense(self.d_model)(x)  # (batch, Nwindow, d_model)
-
-        # Multiple CLS tokens (1 per quantile)
-        cls_tokens = self.param(
-            "cls_tokens",
-            nn.initializers.normal(stddev=0.05),
-            (1, 1, self.d_model)
-        )
-
-        cls_tokens = jnp.tile(cls_tokens, (x.shape[0], 1, 1))  # (batch, nhorizons, d_model)
-
-        # Prepend CLS tokens
-        x = jnp.concatenate([cls_tokens, x], axis=1)  # (batch, nhorizons+Nwindow, d_model)
-
-        # Transformer encoder
-        x = TransformerEncoder(
-            d_model=self.d_model,
-            num_heads=self.num_heads,
-            mlp_dim=self.mlp_dim,
-            num_layers=self.num_layers,
-            dropout=self.dropout
-        )(x, train=train)
-
-        # Extract CLS outputs (first n_quantiles positions)
-        x_cls = x[:, 0, :]  # (batch, nhorizons, d_model)
-
-        # Map CLS outputs to features
-        #out = nn.Dense(self.out_features)(x_cls)  # (batch, n_quantiles, out_features)
-        
-        out = jnp.stack([regressor(x_cls) for i, regressor in enumerate(regressors)], axis=1)
-
-        return out
-"""

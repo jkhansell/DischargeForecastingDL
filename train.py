@@ -10,7 +10,7 @@ import os
 if __name__ == "__main__":
     try:
         model = sys.argv[1]
-
+        print(model)
         if model == "lstm":
             LSTMTrain()
         elif model == "ltcn":
